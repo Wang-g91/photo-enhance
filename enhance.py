@@ -250,7 +250,7 @@ def blur_detail_mask(Y, win=9, mid_lo=0.008, mid_hi=0.025):
 def adaptive_sharpen(bgr, amount=2.0, radius=3, eps=0.0025, soft=0.010,
                      floor=0.10, t0n=0.075, t1n=0.34, tol=0.004,
                      dark_gain=0.0, blur_gain=0.0, cap=1.6,
-                     relative=None, return_maps=False):
+                     relative=None, return_maps=False, protect=None):
     """局部自适应锐化：暗部与糊区各自拿加成，平坦区严格 0。
 
     ★ 相对梯度（mag / (局部亮度 + floor)）是让暗部"进得来"的关键。
@@ -265,6 +265,13 @@ def adaptive_sharpen(bgr, amount=2.0, radius=3, eps=0.0025, soft=0.010,
                            ★ 为什么要这个开关：相对门限会让暗部整体进门限，
                              如果只想"救糊"却顺带把暗部也提了，两个预设就分不开了。
                              分开之后：暗部档才用相对门限，救糊档保持绝对门限。
+    protect                0..1 的"基础锐化保护"掩膜（物件保护）。
+                           ★ 它只削**基础锐化**这一项，不削暗部/糊区加成。
+                             为什么：物件保护的初衷是"别把包当脸一起锐"，
+                             但一开始连加成一起削了 —— 实测「暗部更清晰」档
+                             在包/裤上 78%~83% 的加成被吃掉，预设等于白给。
+                             改成分开削之后：包照原样被保护（不爬纹），
+                             但"这里暗且有纹理"这个判据该拿的清晰度照拿。
     """
     if amount <= 0:
         return (bgr, None, None, None) if return_maps else bgr
@@ -289,7 +296,8 @@ def adaptive_sharpen(bgr, amount=2.0, radius=3, eps=0.0025, soft=0.010,
 
     dmap = dark_detail_mask(Y) if dark_gain > 0 else np.zeros_like(Y)
     bmap = blur_detail_mask(Y) if blur_gain > 0 else np.zeros_like(Y)
-    amap = amount * (1.0 + min(dark_gain, cap) * dmap + min(blur_gain, cap) * bmap)
+    base = amount if protect is None else amount * (1.0 - np.clip(protect, 0.0, 1.0))
+    amap = base + amount * (min(dark_gain, cap) * dmap + min(blur_gain, cap) * bmap)
     Y2 = Y + detail * amap * w
     if tol > 0:
         k = np.ones((3, 3), np.float32)
@@ -435,13 +443,34 @@ def enhance_one(bgr, amount=2.0, obj_mode="original",
 
     dark_gain / blur_gain > 0 时走 adaptive_sharpen（相对梯度门限），
     暗部与糊区各自拿加成；两者都为 0 时走原始档，行为与历史交付物逐像素一致。
+
+    ★ 物件保护只挡"基础锐化"，不挡暗部/糊区加成（2026-10-01 修）：
+        修之前是"先自适应锐化、再和原图按遮罩混合"，等于把加成也一起按遮罩削掉。
+        实测「暗部更清晰」档黑包/黑裤的加成被吃掉 78%~83%，预设形同虚设 ——
+        预设名字写着"黑包更清楚"，拿到的却是接近推荐档的数字。
+        修法：把物件遮罩作为 protect 传进 adaptive_sharpen，
+        让它只削基础项，加成项照拿。
+        改后（示例图，HF 变化）：
+            预设            黑衣    黑包    黑裤    脸
+            推荐           +19%    +9%     +6%   +40%
+            暗部更清晰      +29%   +29%    +28%   +50%
+            全面清晰        +31%   +32%    +29%   +57%
+        「推荐/轻微」两档 dark_gain=blur_gain=0，走的还是老路径，
+        逐像素与历史交付物一致（回归已验证）。
     """
-    if dark_gain > 0 or blur_gain > 0:
+    m = object_mask(bgr)
+    adaptive = dark_gain > 0 or blur_gain > 0
+    if adaptive and obj_mode == "original":
+        # 物件区不参与基础锐化，但暗部/糊区该拿的加成照拿
+        out = adaptive_sharpen(bgr, amount, 3, 0.0025, soft=0.0,
+                               dark_gain=dark_gain, blur_gain=blur_gain,
+                               cap=cap, protect=m)
+        return out, m
+    if adaptive:
         sharp = adaptive_sharpen(bgr, amount, 3, 0.0025, soft=0.0,
                                  dark_gain=dark_gain, blur_gain=blur_gain, cap=cap)
     else:
         sharp = sharpen_edges(bgr, amount, 3, 0.0025, 0.045, 0.20, 0.004)
-    m = object_mask(bgr)
     if obj_mode == "original":
         obj = bgr
     else:
