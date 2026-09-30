@@ -98,8 +98,13 @@ class App:
                                     text="%.1fx" % self.scale.get()))
         self.sl_scl.pack(side="left", padx=8)
         self.lbl_scl = ttk.Label(r1, text="1.0x", width=6); self.lbl_scl.pack(side="left")
-        ttk.Checkbutton(r1, text="自动分流（白底平坦图直接原图直出）",
-                        variable=self.auto_route).pack(side="left", padx=14)
+        r1b = ttk.Frame(opt); r1b.pack(fill="x", padx=8, pady=(0, 6))
+        self.ck_auto = ttk.Checkbutton(
+            r1b, text="自动分流（白底平坦图直接原图直出，不浪费一次重编码）",
+            variable=self.auto_route)
+        self.ck_auto.pack(side="left")
+        ttk.Label(r1b, text="预设会覆盖右侧两个滑块；手动拖动滑块即改为自定义",
+                  foreground="#888").pack(side="left", padx=14)
 
         out = ttk.LabelFrame(self.root, text="4. 输出到（原图绝不会被改动）")
         out.pack(fill="x", **pad)
