@@ -215,18 +215,35 @@ def _box(x, win):
     return cv2.boxFilter(x, -1, (win, win), normalize=True, borderType=cv2.BORDER_REFLECT)
 
 
-def dark_detail_mask(Y, win=41, lo=0.10, hi=0.32, s_lo=0.015, s_hi=0.045):
+def dark_detail_mask(Y, win=9, lo=0.10, hi=0.32, s_lo=0.010, s_hi=0.022):
     """暗部掩膜 = 「此处暗」×「此处有结构」。0..1 float。
 
     为什么不是"暗就够了"：
         暗部里的纯平坦区（黑背景、阴影空洞）没有东西可提，硬提只会把噪点
         和 AI 颗粒拉出来。必须叠一层局部标准差，证明这里有纹理才算数。
 
+    ★ 结构门的窗口必须用 9，不能用 41（2026-10-01 修，实测证据）：
+        原实现 win=41 + (0.015, 0.045)。41px 窗口里，一段**缓坡渐变**的
+        窗口内跨度也有几个色阶 ⇒ sd 被撑到 0.0285，门开到 **45%**。
+        后果：8 位灰渐变上被改了颜色（实测最大差 2），
+        违反"平坦区零改动"这条底线。
+        换 9px 后两个世界的距离立刻拉开：
+            渐变暗段   sd(41)=0.0285  →  sd(9)=0.0071   门 0.452 → 0.000
+            真实包面   sd(41)=0.0641  →  sd(9)=0.0255   门 0.612 → 0.257
+        原因：缓坡在**小窗口内几乎是平的**，只有真纹理才有局部起伏。
+        门限随之从 (0.015,0.045) 调到 (0.010,0.022) —— 配合小窗口的尺度。
+
     实测（示例人像图）：黑包 0.58 / 上衣 0.45 / 裤 0.28 / 脸 0.14 /
                         天空 0.002 / 橙墙 0.000
     门槛 lo/hi 标定依据：黑包局部亮度 0.128、上衣 0.169、裤 0.251、脸 0.375。
         取 lo=0.10 hi=0.32，让"脸"落在斜坡尾部（0.14）而不是被完全排除 ——
         脸部暗侧确实有可提的纹理，但不该像黑包那样吃满。
+
+    换窗口后各区域门值实测（旧值 → 新值）：
+        脸 0.111→0.037  耳环 0.017→0.004  黑衣 0.396→0.234
+        黑包 0.472→0.267  黑裤 0.420→0.435（反而升）  蓝天 0.000→0.000
+        灰渐变 0.081→0.004（这才是重点：误判被关掉了）
+    ⇒ 真实暗部该拿的照拿（黑裤甚至更多），渐变不再被误伤。
     """
     m = _box(Y, win)
     sd = np.sqrt(np.maximum(_box(Y * Y, win) - m * m, 0.0))
@@ -277,6 +294,68 @@ def blur_detail_mask(Y, win=9, mid_lo=0.008, mid_hi=0.025):
                          0.015, 0.050)            # 没内容的区域不叫"糊"，叫"平"
     return np.clip((1.0 - _smoothstep(loss, 0.06, 0.16)) * struct,
                    0.0, 1.0)
+
+
+def clarity_boost(bgr, gain=1.0, r_small=4, r_big=32, eps=0.0025,
+                  e_lo=0.030, e_hi=0.160, win=9, sd_lo=0.008, sd_hi=0.022):
+    """局部对比增强（Clarity）—— 放大「中等尺度的明暗过渡」，不是锐化。
+
+    ★ 为什么需要它（2026-10-01 实测，用户第三次说"跟原图差不多"）：
+        量下来，锐化把 HF（像素级锐度）提了 +46%，看着数字很大，
+        但**局部对比只提了 +5.4%** —— 人眼判断"清不清楚"根本不看那个数。
+        把图按频段拆开看能量占比：
+            极高频 (sigma 0.7)   0.7%   ← 锐化主要动这一段
+            高频   (sigma 2.0)   6.9%
+            中频   (sigma 8.0)  34.8%   ← 人眼主要看这段
+            低频   (sigma 24)   57.6%
+        ⇒ "HF +46% 但看不出差别"不是错觉，是量在了错的地方。
+
+    ★ 为什么不能简单把中频放大（试过，数据在这里）：
+        高斯中频 gain 0.5 ⇒ 局部对比 +40%，但光晕像素 15.0%、平坦区最大差 16
+        高斯中频 gain 0.7 ⇒ 局部对比 +59%，但光晕像素 28.6%、平坦区最大差 21
+        强边两侧必然过冲 —— 石墙与包的交界会出白边。这不是调参能绕开的。
+
+    ★ 本函数用的三条对策：
+        ① 保边分解：用导引滤波（小半径 / 大半径之差）代替高斯。
+           两边都保边，所以强边不会被"过度矫正"。
+        ② 边缘门控：按平滑后的梯度幅值给增益 ——
+           强边（>= e_hi）处增益归零，中等纹理处满增益。
+           光晕只出在强边两侧，那里不增益就没有光晕。
+        ③ 平坦门：局部标准差太小的地方（白底/渐变）严格不动。
+           ★ 窗口必须用 9 而不是 61（实测踩过，2026-10-01）：
+             用 61px 大窗口算标准差时，**缓坡渐变和真实纹理分不开** ——
+                 灰渐变 sd(61)=0.0472   真实包面 sd(61)=0.0697   ← 只差 1.5 倍
+             门限 0.020 被渐变轻松超过，于是灰渐变被当成"有内容"，
+             色阶被改了 7 个 —— 违反"平坦区零改动"这条底线。
+             换成 9px 小窗口立刻分开：
+                 灰渐变 sd(9)=0.0073    真实包面 sd(9)=0.0234   ← 差 3.2 倍
+             原因：缓坡在**小窗口内几乎是平的**（相邻像素差极小），
+             只有真实纹理才有局部起伏。小窗口量的才是"纹理度"。
+             改后：灰渐变最大差 7 -> 0（回到零改动），
+             而真实包面的中频增益不变（数值见下方实测）。
+
+    ★ 实测（示例包图，叠加在「全面清晰」之上）：
+        gain 1.0：局部对比 +7.2%  光晕>3 占 2.36%  光晕>6 占 0.24%
+                  HF +41.5%  平坦区最大差 8（可接受）
+        gain 1.5：局部对比 +8.7%  光晕 5.5%   ← 开始看得见
+        gain 2.0：局部对比 +9.3%  光晕 10.1%  ← 明显白边，不取
+        ⇒ 预设定在 gain 1.0。再往上就不是"增强"而是"失真"了。
+    """
+    if gain <= 0:
+        return bgr
+    ycc = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb).astype(np.float32)
+    Y = ycc[..., 0] / 255.0
+    lc = guided_filter(Y, Y, r_small, eps) - guided_filter(Y, Y, r_big, eps)
+    gx = cv2.Sobel(Y, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(Y, cv2.CV_32F, 0, 1, ksize=3)
+    edge = _box(np.sqrt(gx * gx + gy * gy), 9)
+    gate = 1.0 - _smoothstep(edge, e_lo, e_hi)
+    m = _box(Y, win)
+    sd = np.sqrt(np.maximum(_box(Y * Y, win) - m * m, 0.0))
+    gate = gate * _smoothstep(sd, sd_lo, sd_hi)
+    Y2 = np.clip(Y + lc * gain * gate, 0.0, 1.0)
+    ycc[..., 0] = Y2 * 255.0
+    return cv2.cvtColor(ycc.astype(np.uint8), cv2.COLOR_YCrCb2BGR)
 
 
 def adaptive_sharpen(bgr, amount=2.0, radius=3, eps=0.0025, soft=0.010,
@@ -371,6 +450,12 @@ PRESETS = {
         "amount": 1.2, "dark_gain": 0.0, "blur_gain": 0.0,
         "obj_safe": True, "scale": 1.0,
     },
+    "对比感增强": {
+        "desc": "锐化更强 + 额外拉开中等尺度的明暗过渡（褶皱/结构），效果最明显的一档。"
+                "代价：不再是零失真，强边处有极轻微光晕（实测 0.4% 像素，最大过冲 9/255）。",
+        "amount": 3.5, "dark_gain": 0.9, "blur_gain": 1.2, "clarity": 1.0,
+        "obj_safe": False, "scale": 1.0,
+    },
     "清晰 + 放大2倍": {
         "desc": "在全面清晰的基础上做 2 倍 Lanczos 放大（插值，不是超分，不会增加细节）。",
         "amount": 2.2, "dark_gain": 0.9, "blur_gain": 1.2,
@@ -380,8 +465,14 @@ PRESETS = {
 
 
 def apply_preset(name):
-    """取预设；名字不认识时回退到推荐档。"""
-    return dict(PRESETS.get(name, PRESETS["推荐"]))
+    """取预设；名字不认识时回退到推荐档。
+
+    clarity 只有「对比感增强」那档有 —— 不补默认值的话调用方每次都得写
+    p.get("clarity", 0.0)，漏一处就是 KeyError。这里统一补齐。
+    """
+    p = dict(PRESETS.get(name, PRESETS["推荐"]))
+    p.setdefault("clarity", 0.0)
+    return p
 
 
 # ============================================================================
@@ -465,7 +556,7 @@ def measure(path, width=750, amount=2.0, cap=2048):
 # ============================================================================
 
 def enhance_one(bgr, amount=2.0, obj_mode="original",
-                dark_gain=0.0, blur_gain=0.0, cap=1.6):
+                dark_gain=0.0, blur_gain=0.0, cap=1.6, clarity=0.0):
     """返回 (成品, 遮罩)。
 
     默认档（obj_mode="original"）：
@@ -497,6 +588,8 @@ def enhance_one(bgr, amount=2.0, obj_mode="original",
         out = adaptive_sharpen(bgr, amount, 3, 0.0025, soft=0.0,
                                dark_gain=dark_gain, blur_gain=blur_gain,
                                cap=cap, protect=m)
+        if clarity > 0:
+            out = clarity_boost(out, clarity)
         return out, m
     if adaptive:
         sharp = adaptive_sharpen(bgr, amount, 3, 0.0025, soft=0.0,
@@ -684,7 +777,8 @@ def iter_images(root):
             yield os.path.join(dirpath, f)
 
 
-def run_batch(indir, outdir, amount, judge_only, force, scale, dark_gain=0.0, blur_gain=0.0):
+def run_batch(indir, outdir, amount, judge_only, force, scale,
+              dark_gain=0.0, blur_gain=0.0, clarity=0.0):
     files = list(iter_images(indir))
     if not files:
         print("[X] 目录里没找到图: " + indir)
@@ -710,7 +804,8 @@ def run_batch(indir, outdir, amount, judge_only, force, scale, dark_gain=0.0, bl
                                     os.path.splitext(os.path.basename(rel))[0] + "_enh.png")
             if do:
                 src = _read(p)
-                out, _m = enhance_one(src, amount, dark_gain=dark_gain, blur_gain=blur_gain)
+                out, _m = enhance_one(src, amount, dark_gain=dark_gain,
+                                      blur_gain=blur_gain, clarity=clarity)
                 _write(out_path, upscale(out, scale))
             elif os.path.splitext(p)[1].lower() == ".png" and scale <= 1.0:
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -780,17 +875,19 @@ def main():
     if a.preset:
         p = apply_preset(a.preset)
         amount, dark_gain, blur_gain, scale = p["amount"], p["dark_gain"], p["blur_gain"], p["scale"]
+        clarity = p.get("clarity", 0.0)
         if a.amount != 2.0:
             amount = a.amount
         if a.scale != 1.0:
             scale = a.scale
         print("预设「%s」：%s" % (a.preset, p["desc"]))
     else:
-        amount, dark_gain, blur_gain, scale = a.amount, 0.0, 0.0, a.scale
+        amount, dark_gain, blur_gain, scale, clarity = a.amount, 0.0, 0.0, a.scale, 0.0
 
     if os.path.isdir(a.input):
         outdir = a.output or (a.input.rstrip("\\/") + "_增强")
-        return run_batch(a.input, outdir, amount, a.judge, a.force, scale, dark_gain, blur_gain)
+        return run_batch(a.input, outdir, amount, a.judge, a.force, scale,
+                         dark_gain, blur_gain, clarity)
     if not os.path.isfile(a.input):
         print("[X] 找不到: " + a.input)
         return 1
@@ -813,7 +910,8 @@ def main():
     src = _read(a.input)
     do = a.force or v["verdict"] in ("run", "marginal")
     if do:
-        out, m = enhance_one(src, amount, a.obj_mode, dark_gain=dark_gain, blur_gain=blur_gain)
+        out, m = enhance_one(src, amount, a.obj_mode, dark_gain=dark_gain,
+                             blur_gain=blur_gain, clarity=clarity)
         _write(out_path, upscale(out, scale))
         print("完成 -> %s  (%.2fs)" % (out_path, time.time() - t0))
         if a.report:

@@ -278,11 +278,16 @@ class App:
         p = E.apply_preset(self.preset.get())
         dark = p["dark_gain"] if self.preset.get() != "推荐" else 0.0
         blur = p["blur_gain"] if self.preset.get() != "推荐" else 0.0
+        clarity = float(p.get("clarity", 0.0))
         self.write("=" * 66)
         self.write("预设「%s」：%s" % (self.preset.get(), p["desc"]))
         self.write("共 %d 张，锐化 %.1f，放大 %.1fx，自动分流 %s"
                    % (len(files), self.amount.get(), self.scale.get(),
                       "开" if self.auto_route.get() else "关"))
+        if clarity > 0:
+            # ★ 唯一会改观感的一档 —— 必须提前说清楚，别让用户自己发现
+            self.write("⚠ 这一档会拉开明暗对比（不是纯锐化），观感会变、强边处有极轻微光晕。"
+                       "想要零失真的档位请选前五个。")
         if judge:
             self.write("模式：只判定，不出图")
         else:
@@ -295,13 +300,13 @@ class App:
         #   "main thread is not in main loop"（实测踩过）。
         t = threading.Thread(
             target=self._work,
-            args=(files, out, judge, dark, blur,
+            args=(files, out, judge, dark, blur, clarity,
                   float(self.amount.get()), float(self.scale.get()),
                   bool(self.auto_route.get())),
             daemon=True)
         t.start()
 
-    def _work(self, files, out, judge, dark, blur, amount, scale, auto):
+    def _work(self, files, out, judge, dark, blur, clarity, amount, scale, auto):
         t0 = time.time(); n_run = n_skip = n_err = 0
         self.q.put(("reset", None))
         if not judge:
@@ -325,7 +330,8 @@ class App:
                 try:
                     if do:
                         src = E._read(p)
-                        o, _m = E.enhance_one(src, amount, dark_gain=dark, blur_gain=blur)
+                        o, _m = E.enhance_one(src, amount, dark_gain=dark,
+                                              blur_gain=blur, clarity=clarity)
                         E._write(dst, E.upscale(o, scale))
                     elif rel.lower().endswith(".png") and scale <= 1.0:
                         shutil.copy2(p, dst)          # 直出 = 逐字节原样
