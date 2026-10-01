@@ -443,6 +443,15 @@ def adaptive_sharpen(bgr, amount=2.0, radius=3, eps=0.0025, soft=0.010,
 # ============================================================================
 
 PRESETS = {
+    # ★ 「只压体积」不是"对照"，是正经功能（2026-10-01 用户口径）：
+    #   "不用这预设原图风格压缩" —— 画面一个像素都不动，只把 MB 压成 KB。
+    #   标记 plain=True，调用方据此走 compress_only 那条路，不做任何锐化。
+    "只压体积": {
+        "desc": "不做任何增强，画面一个像素都不动 —— 只按尺寸策略重新编码，把 MB 压成 KB。"
+                "给「原图风格不能变、但文件太大」用。",
+        "amount": 1.0, "dark_gain": 0.0, "blur_gain": 0.0,
+        "obj_safe": True, "scale": 1.0, "plain": True,
+    },
     "推荐": {
         "desc": "人物区锐化，暗且中性的物件区保持原图。最稳，任何图都不会失真。",
         "amount": 2.0, "dark_gain": 0.0, "blur_gain": 0.0,
@@ -833,7 +842,9 @@ def iter_images(root):
         实测：4 张源图跑出 6 张成品，多出来的两张是 grid-1-1-top-left_enh_enh.png。
 
         所以：① 名字以 _增强 结尾的目录整个跳过（本工具的默认输出目录名）；
-              ② 以 _enh.png 结尾的文件跳过（本工具的成品命名）；
+              ② 以 _enh.* / _压缩.* 结尾的文件跳过（本工具两种成品命名）；
+                 漏了 _压缩 那一类的话，「只压体积」跑第二次会把上一次的
+                 成品当新输入，压上加压。
               ③ chk 类临时文件（.prep.）跳过（那是看图前的压缩副本）。
         三者都是本工具自己的产物，不该再被当输入。
     """
@@ -847,6 +858,8 @@ def iter_images(root):
                 continue
             if low.endswith("_enh.png") or low.endswith("_enh.jpg") or low.endswith("_enh.jpeg"):
                 continue                    # 本工具自己的成品
+            if low.endswith("_压缩.png") or low.endswith("_压缩.jpg") or low.endswith("_压缩.jpeg"):
+                continue                    # 「只压体积」的成品
             yield os.path.join(dirpath, f)
 
 
@@ -889,7 +902,7 @@ def run_batch(indir, outdir, amount, judge_only, force, scale,
         if not judge_only:
             out_path = os.path.join(outdir, os.path.dirname(rel),
                                     os.path.splitext(os.path.basename(rel))[0]
-                                    + ("_cmp" if compress_only else "_enh") + ext)
+                                    + ("_压缩" if compress_only else "_enh") + ext)
             if compress_only:
                 # 不锐化、不归一尺度 —— 只按需缩图 + 按 format/quality 重新编码
                 work, _s = fit_long_edge(_read(p), shrink)
@@ -1010,6 +1023,10 @@ def main():
             amount = a.amount
         if a.scale != 1.0:
             scale = a.scale
+        # ★ 预设「只压体积」= 不做任何增强，只重新编码。
+        #   选它就该走 compress_only，别偷偷跑到锐化那条路上去。
+        if p.get("plain"):
+            a.compress_only = True
         print("预设「%s」：%s" % (a.preset, p["desc"]))
     else:
         amount, dark_gain, blur_gain, scale, clarity = a.amount, 0.0, 0.0, a.scale, 0.0
@@ -1041,9 +1058,9 @@ def main():
     hi = a.format == "jpeg-hi"
     ext = ".jpg" if is_jpg else ".png"
     base = os.path.splitext(os.path.basename(a.input))[0]
-    # ★ 只压缩走 _cmp 后缀，增强走 _enh —— 两条路可以落在同一个目录里对比，
-    #   互相不会覆盖（撞名了就没法等量对比了）。
-    out_path = os.path.join(outdir, base + ("_cmp" if a.compress_only else "_enh") + ext)
+    # ★ 只压缩走 _压缩 后缀，增强走 _enh —— 两条路可以落在同一个目录里，
+    #   互相不会覆盖，一眼能分出哪个是原风格压缩、哪个是增强过的。
+    out_path = os.path.join(outdir, base + ("_压缩" if a.compress_only else "_enh") + ext)
     src = _read(a.input)
     q = (95 if hi else a.quality) if is_jpg else None
     if a.compress_only:

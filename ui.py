@@ -173,10 +173,10 @@ class App:
         self.btn.pack(side="left")
         ttk.Button(run, text="只判定不出图", command=lambda: self.start(judge=True)).pack(
             side="left", padx=6)
-        # ★ 「只压缩」= 不做任何增强，只按当前尺寸策略/格式重新编码。
-        #   用途：把它和增强后的结果摆在一起比 —— 尤其是风格化的图，
-        #   人物/物件本来就柔和，没有基准线很难判断增强到底带来了多少。
-        ttk.Button(run, text="只压缩（对照）",
+        # ★ 「原风格压缩」= 不做任何增强，只按当前尺寸策略/格式重新编码。
+        #   两种用法：① 当基准线，和增强结果摆一起比；
+        #             ② 就是你要的成品 —— 原图风格不能变，只想把 MB 压成 KB。
+        ttk.Button(run, text="原风格压缩",
                    command=lambda: self.start(compress_only=True)).pack(side="left", padx=6)
         ttk.Button(run, text="跑自检", command=self.selftest).pack(side="left", padx=6)
         # ★ 跑完一键看结果：直接拿系统默认看图程序打开最新的那张，不用自己翻目录
@@ -297,6 +297,12 @@ class App:
         self.amount.set(p["amount"]); self.scale.set(p["scale"])
         self.lbl_amt.config(text="%.1f" % p["amount"])
         self.lbl_scl.config(text="%.1fx" % p["scale"])
+        if p.get("plain"):
+            # ★ 「只压体积」档：不锐化、不改任何尺度，只重新编码。
+            #   选它的时候自动把尺寸策略踢到"保持原像素"，否则默认的"缩到长边"
+            #   会悄悄把像素改掉 —— 那就不是"原图风格压缩"了。
+            self.size_mode.set("normalize")
+        self.on_shrink()
 
     def on_shrink(self):
         """把当前尺寸策略翻译成一句人话，实时显示。
@@ -395,6 +401,10 @@ class App:
         dark = p["dark_gain"] if self.preset.get() != "推荐" else 0.0
         blur = p["blur_gain"] if self.preset.get() != "推荐" else 0.0
         clarity = float(p.get("clarity", 0.0))
+        # ★ 选了「只压体积」档 = 走 compress_only 那条路（不锐化）。
+        #   这样用户只要"选预设 + 点开始"，不用另外去按「只压缩」按钮。
+        if p.get("plain") and not judge:
+            compress_only = True
         # ★ 尺寸策略（见 enhance.fit_long_edge / enhance_one 的 display_w）。
         #   tkinter 变量的读取一律留在主线程，只把值传进工作线程。
         mode = self.size_mode.get()
@@ -407,7 +417,11 @@ class App:
         fmt = self.fmt.get()
         self.write("=" * 66)
         if compress_only:
-            self.write("★ 只压缩（对照）—— 不做任何增强，只按下面的尺寸/格式重新编码")
+            # 两条来路共用这条路：① 预设「只压体积」；② 按钮「只压缩（对照）」
+            src_tag = ("预设「只压体积」" if p.get("plain")
+                       else "只压缩（对照）")
+            self.write("★ %s —— 不做任何增强，画面一个像素都不动，"
+                       "只按下面的尺寸/格式重新编码" % src_tag)
         else:
             self.write("预设「%s」：%s" % (self.preset.get(), p["desc"]))
             self.write("共 %d 张，锐化 %.1f，放大 %.1fx，自动分流 %s，输出 %s"
@@ -479,9 +493,10 @@ class App:
                                os.path.basename(p))))
             if not judge:
                 rel = os.path.basename(p)
-                # ★ 只压缩走 _cmp 后缀，增强走 _enh —— 两条路可以落在同一个目录里对比
+                # ★ 只压缩走 _压缩 后缀，增强走 _enh —— 两条路可以落在同一个目录里，
+                #   一眼分出哪个是原风格压缩、哪个是增强过的
                 dst = os.path.join(out, os.path.splitext(rel)[0]
-                                   + ("_cmp" if compress_only else "_enh") + ext)
+                                   + ("_压缩" if compress_only else "_enh") + ext)
                 try:
                     if compress_only:
                         # 不锐化、不归一尺度 —— 只按需缩图 + 重新编码
