@@ -157,6 +157,11 @@ class App:
         self.btn.pack(side="left")
         ttk.Button(run, text="只判定不出图", command=lambda: self.start(judge=True)).pack(
             side="left", padx=6)
+        # ★ 「只压缩」= 不做任何增强，只按当前尺寸策略/格式重新编码。
+        #   用途：把它和增强后的结果摆在一起比 —— 尤其是风格化的图，
+        #   人物/物件本来就柔和，没有基准线很难判断增强到底带来了多少。
+        ttk.Button(run, text="只压缩（对照）",
+                   command=lambda: self.start(compress_only=True)).pack(side="left", padx=6)
         ttk.Button(run, text="跑自检", command=self.selftest).pack(side="left", padx=6)
         # ★ 跑完一键看结果：直接拿系统默认看图程序打开最新的那张，不用自己翻目录
         self.btn_look = ttk.Button(run, text="看最新结果", command=self.open_latest,
@@ -309,7 +314,7 @@ class App:
             foreground="#0a7")
 
     # ---------- 执行 ----------
-    def start(self, judge=False):
+    def start(self, judge=False, compress_only=False):
         if self.busy:
             return
         if not self.inputs:
@@ -358,24 +363,36 @@ class App:
         dispw = px if mode == "normalize" else 0
         fmt = self.fmt.get()
         self.write("=" * 66)
-        self.write("预设「%s」：%s" % (self.preset.get(), p["desc"]))
-        self.write("共 %d 张，锐化 %.1f，放大 %.1fx，自动分流 %s，输出 %s"
-                   % (len(files), self.amount.get(), self.scale.get(),
-                      "开" if self.auto_route.get() else "关",
-                      "JPEG" if fmt == "jpeg" else "PNG"))
-        if shrink:
+        if compress_only:
+            self.write("★ 只压缩（对照）—— 不做任何增强，只按下面的尺寸/格式重新编码")
+        else:
+            self.write("预设「%s」：%s" % (self.preset.get(), p["desc"]))
+            self.write("共 %d 张，锐化 %.1f，放大 %.1fx，自动分流 %s，输出 %s"
+                       % (len(files), self.amount.get(), self.scale.get(),
+                          "开" if self.auto_route.get() else "关",
+                          "JPEG" if fmt == "jpeg" else "PNG"))
+        if compress_only:
+            # 这条路不锐化，别照抄增强那边的措辞（会误导成"缩完还要锐"）
+            if shrink:
+                self.write("按原图缩到长边 %d px，然后直接编码（只缩不锐）" % shrink)
+            else:
+                self.write("像素尺寸原样保留，直接编码")
+        elif shrink:
             self.write("先缩到长边 %d px 再锐化 —— 比先锐后缩更清晰，文件也更小" % shrink)
         elif dispw:
             self.write("保持原始像素，把锐化尺度按 %d px 显示宽度归一 —— "
                        "平台缩图后剩下的清晰度接近「缩图再锐化」那档" % dispw)
         else:
             self.write("按原图像素尺度处理（历史行为）")
-        if clarity > 0:
+        if clarity > 0 and not compress_only:
             # ★ 唯一会改观感的一档 —— 必须提前说清楚，别让用户自己发现
             self.write("⚠ 这一档会拉开明暗对比（不是纯锐化），观感会变、强边处有极轻微光晕。"
                        "想要零失真的档位请选前五个。")
         if judge:
             self.write("模式：只判定，不出图")
+        elif compress_only:
+            self.write("输出：%s    共 %d 张，输出 %s"
+                       % (out, len(files), "JPEG" if fmt == "jpeg" else "PNG"))
         else:
             self.write("输出：%s" % out)
         self.write("源图：只读，不会有任何改动")
@@ -388,13 +405,13 @@ class App:
             target=self._work,
             args=(files, out, judge, dark, blur, clarity,
                   float(self.amount.get()), float(self.scale.get()),
-                  bool(self.auto_route.get()), shrink, fmt, dispw),
+                  bool(self.auto_route.get()), shrink, fmt, dispw, compress_only),
             daemon=True)
         t.start()
 
     def _work(self, files, out, judge, dark, blur, clarity, amount, scale, auto,
-              shrink=0, fmt="png", dispw=0):
-        t0 = time.time(); n_run = n_skip = n_err = 0
+              shrink=0, fmt="png", dispw=0, compress_only=False):
+        t0 = time.time(); n_run = n_skip = n_err = n_cmp = 0
         tot_in = tot_out = 0
         ext = ".jpg" if fmt == "jpeg" else ".png"
         q = 92 if fmt == "jpeg" else None
@@ -410,15 +427,25 @@ class App:
                             % (i, len(files), os.path.basename(p), str(exc)[:60])))
                 n_err += 1; self.q.put(("pb", i)); continue
             do = (not auto) or v["verdict"] in ("run", "marginal")
-            self.q.put(("log", "[%d/%d] %-8s %s  带内 %.3f  链路 %+.1f%%   %s"
-                        % (i, len(files), v["verdict"], "增强" if do else "直出",
-                           v["band_ratio"], v["hf_gain_chain"] * 100,
-                           os.path.basename(p))))
+            if compress_only:
+                self.q.put(("log", "[%d/%d] 只压缩   %s"
+                            % (i, len(files), os.path.basename(p))))
+            else:
+                self.q.put(("log", "[%d/%d] %-8s %s  带内 %.3f  链路 %+.1f%%   %s"
+                            % (i, len(files), v["verdict"], "增强" if do else "直出",
+                               v["band_ratio"], v["hf_gain_chain"] * 100,
+                               os.path.basename(p))))
             if not judge:
                 rel = os.path.basename(p)
-                dst = os.path.join(out, os.path.splitext(rel)[0] + "_enh" + ext)
+                # ★ 只压缩走 _cmp 后缀，增强走 _enh —— 两条路可以落在同一个目录里对比
+                dst = os.path.join(out, os.path.splitext(rel)[0]
+                                   + ("_cmp" if compress_only else "_enh") + ext)
                 try:
-                    if do:
+                    if compress_only:
+                        # 不锐化、不归一尺度 —— 只按需缩图 + 重新编码
+                        work, _s = E.fit_long_edge(E._read(p), shrink)
+                        E._write(dst, E.upscale(work, scale), q)
+                    elif do:
                         src = E._read(p)
                         work, _s = E.fit_long_edge(src, shrink)   # ★ 先缩
                         o, _m = E.enhance_one(work, amount, dark_gain=dark,
@@ -446,11 +473,15 @@ class App:
                         if ln.strip():
                             self.q.put(("log", "        " + ln.strip()))
                     n_err += 1
-                rows.append([rel, v["verdict"], "增强" if do else "直出",
+                rows.append([rel, v["verdict"],
+                             "只压缩" if compress_only else ("增强" if do else "直出"),
                              "%.3f" % v["band_ratio"], "%.3f" % v["mask_cov"],
                              "%+.1f%%" % (v["hf_gain_chain"] * 100)])
-            n_run += 1 if do else 0
-            n_skip += 0 if do else 1
+            if compress_only:
+                n_cmp += 1
+            else:
+                n_run += 1 if do else 0
+                n_skip += 0 if do else 1
             self.q.put(("pb", i))
         if not judge:
             import csv
@@ -460,8 +491,13 @@ class App:
             self.q.put(("log", "报告 -> %s" % rp))
         dt = time.time() - t0
         self.q.put(("log", "-" * 66))
-        self.q.put(("log", "完成：增强 %d / 直出 %d / 出错 %d，用时 %.1fs（%.2fs/张）"
-                    % (n_run, n_skip, n_err, dt, dt / max(1, len(files)))))
+        if compress_only:
+            self.q.put(("log", "完成：只压缩 %d / 出错 %d，用时 %.1fs（%.2fs/张）"
+                        % (n_cmp, n_err, dt, dt / max(1, len(files)))))
+            self.q.put(("log", "★ 这一轮没有做任何增强（像素未改），只是重新编码 —— 用于对照"))
+        else:
+            self.q.put(("log", "完成：增强 %d / 直出 %d / 出错 %d，用时 %.1fs（%.2fs/张）"
+                        % (n_run, n_skip, n_err, dt, dt / max(1, len(files)))))
         if not judge and tot_in:
             self.q.put(("log", "体积：%.1f MB -> %.1f MB（省 %.0f%%）"
                         % (tot_in / 1048576.0, tot_out / 1048576.0,

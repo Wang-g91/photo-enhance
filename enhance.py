@@ -837,13 +837,13 @@ def iter_images(root):
 
 def run_batch(indir, outdir, amount, judge_only, force, scale,
               dark_gain=0.0, blur_gain=0.0, clarity=0.0,
-              shrink=0, fmt="png", quality=92, display_w=0):
+              shrink=0, fmt="png", quality=92, display_w=0, compress_only=False):
     files = list(iter_images(indir))
     if not files:
         print("[X] 目录里没找到图: " + indir)
         return 1
     rows, t_all = [], time.time()
-    n_run = n_skip = n_err = 0
+    n_run = n_skip = n_err = n_cmp = 0
     ext = ".jpg" if fmt == "jpeg" else ".png"
     q = quality if fmt == "jpeg" else None
     tot_in = tot_out = 0
@@ -856,15 +856,27 @@ def run_batch(indir, outdir, amount, judge_only, force, scale,
             rows.append({"file": rel, "verdict": "error", "why": str(exc)[:100]})
             n_err += 1
             continue
-        do = force or v["verdict"] in ("run", "marginal")
-        tag = "增强" if do else "直出"
+        # ★ compress_only：一个字都不改，只重新编码（+ 可选的缩图）。
+        #   它是"增强到底有没有用"的对照组 —— 尤其是风格化的图，
+        #   人物/物件本身已经足够柔和，光看压缩后的观感很难分辨，
+        #   所以需要一条"原图直接压缩"的基准线摆在一起比。
+        if compress_only:
+            do, tag = False, "只压缩"
+        else:
+            do = force or v["verdict"] in ("run", "marginal")
+            tag = "增强" if do else "直出"
         print("[%d/%d] %-8s %s  带内%.3f 链路%+.1f%%  %s"
               % (i, len(files), v["verdict"], tag, v["band_ratio"],
                  v["hf_gain_chain"] * 100, rel))
         if not judge_only:
             out_path = os.path.join(outdir, os.path.dirname(rel),
-                                    os.path.splitext(os.path.basename(rel))[0] + "_enh" + ext)
-            if do:
+                                    os.path.splitext(os.path.basename(rel))[0]
+                                    + ("_cmp" if compress_only else "_enh") + ext)
+            if compress_only:
+                # 不锐化、不归一尺度 —— 只按需缩图 + 按 format/quality 重新编码
+                work, _s = fit_long_edge(_read(p), shrink)
+                _write(out_path, upscale(work, scale), q)
+            elif do:
                 src = _read(p)
                 # ★ 顺序要紧：先按长边缩图，再锐化 —— 缩图在锐化之后会把锐出来的
                 #   高频采掉（实测剩下的不到一半），见 fit_long_edge 的注释。
@@ -884,8 +896,11 @@ def run_batch(indir, outdir, amount, judge_only, force, scale,
                 tot_out += os.path.getsize(out_path)
             except OSError:
                 pass
-        n_run += 1 if do else 0
-        n_skip += 0 if do else 1
+        if compress_only:
+            n_cmp += 1
+        else:
+            n_run += 1 if do else 0
+            n_skip += 0 if do else 1
         rows.append({"file": rel, "verdict": v["verdict"], "action": tag,
                      "band_ratio": v["band_ratio"], "mask_cov": v["mask_cov"],
                      "hf_gain_chain": v["hf_gain_chain"]})
@@ -899,8 +914,13 @@ def run_batch(indir, outdir, amount, judge_only, force, scale,
             w.writeheader()
             w.writerows(rows)
     dt = time.time() - t_all
-    print("\n共 %d 张：增强 %d / 直出 %d / 出错 %d     耗时 %.1fs（%.2fs/张）"
-          % (len(files), n_run, n_skip, n_err, dt, dt / max(1, len(files))))
+    if compress_only:
+        print("\n共 %d 张：只压缩 %d / 出错 %d     耗时 %.1fs（%.2fs/张）"
+              % (len(files), n_cmp, n_err, dt, dt / max(1, len(files))))
+        print("★ 这一轮没有做任何增强（像素未改），只是重新编码 —— 用于对照")
+    else:
+        print("\n共 %d 张：增强 %d / 直出 %d / 出错 %d     耗时 %.1fs（%.2fs/张）"
+              % (len(files), n_run, n_skip, n_err, dt, dt / max(1, len(files))))
     if not judge_only and tot_in:
         print("体积：%.1f MB -> %.1f MB（省 %.0f%%）"
               % (tot_in / 1048576.0, tot_out / 1048576.0,
@@ -942,6 +962,9 @@ def main():
     ap.add_argument("--obj-mode", choices=("original", "enhance"), default="original",
                     help="物件区：original=保持原图（默认，推荐）；enhance=也锐化（旧档，会沉暗部）")
     ap.add_argument("--report", action="store_true", help="打印各亮度档读数")
+    ap.add_argument("--compress-only", action="store_true",
+                    help="不做任何增强，只把原图重新编码（可配 --shrink/--format/--quality）。"
+                         "用于对照：看看「只压缩」和「增强后压缩」到底差多少")
     ap.add_argument("--json", action="store_true", help="判定结果以 JSON 输出")
     ap.add_argument("--selftest", action="store_true", help="跑自检（不需要外部图）")
     a = ap.parse_args()
@@ -975,7 +998,8 @@ def main():
         outdir = a.output or (a.input.rstrip("\\/") + "_增强")
         return run_batch(a.input, outdir, amount, a.judge, a.force, scale,
                          dark_gain, blur_gain, clarity,
-                         a.shrink, a.format, a.quality, a.display_width)
+                         a.shrink, a.format, a.quality, a.display_width,
+                         a.compress_only)
     if not os.path.isfile(a.input):
         print("[X] 找不到: " + a.input)
         return 1
@@ -995,9 +1019,21 @@ def main():
     outdir = a.output or "out"
     ext = ".jpg" if a.format == "jpeg" else ".png"
     base = os.path.splitext(os.path.basename(a.input))[0]
-    out_path = os.path.join(outdir, base + "_enh" + ext)
+    # ★ 只压缩走 _cmp 后缀，增强走 _enh —— 两条路可以落在同一个目录里对比，
+    #   互相不会覆盖（撞名了就没法等量对比了）。
+    out_path = os.path.join(outdir, base + ("_cmp" if a.compress_only else "_enh") + ext)
     src = _read(a.input)
     q = a.quality if a.format == "jpeg" else None
+    if a.compress_only:
+        # 只重新编码：不锐化、不归一尺度，像素级一个字节都不动（除非 --shrink/--scale）
+        work, sfit = fit_long_edge(src, a.shrink)
+        _write(out_path, upscale(work, scale), q)
+        print("只压缩（未做任何增强）-> %s  (%.2fs)" % (out_path, time.time() - t0))
+        if sfit < 1.0:
+            print("       长边 %d -> %d px" % (max(src.shape[:2]), max(work.shape[:2])))
+        print("       体积 %.0f KB -> %.0f KB"
+              % (os.path.getsize(a.input) / 1024.0, os.path.getsize(out_path) / 1024.0))
+        return 0
     do = a.force or v["verdict"] in ("run", "marginal")
     if do:
         work, sfit = fit_long_edge(src, a.shrink)
