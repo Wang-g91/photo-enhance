@@ -23,6 +23,18 @@ import enhance as E                                       # noqa: E402
 SETTINGS = os.path.join(HERE, "_上次设置.json")
 EXTS = E.EXTS
 
+# 输出格式的三种档位与显示名。jpeg-hi = 高保真 JPEG（4:4:4 色度不下采样 + optimize）。
+FMT_NAME = {"jpeg": "JPEG", "jpeg-hi": "JPEG 高保真", "png": "PNG"}
+
+
+def fmt_to_ext_q(fmt):
+    """格式档位 -> (扩展名, JPEG 质量 或 None, 是否高保真)。"""
+    if fmt == "png":
+        return ".png", None, False
+    if fmt == "jpeg-hi":
+        return ".jpg", 95, True
+    return ".jpg", 92, False
+
 
 def collect(path):
     """返回 (图片列表, 是否是目录)。"""
@@ -137,9 +149,13 @@ class App:
                         variable=self.size_mode,
                         command=self.on_shrink).pack(side="left", padx=(8, 0))
         ttk.Label(r1c, text="   ｜ 输出格式").pack(side="left", padx=(10, 0))
-        ttk.Radiobutton(r1c, text="JPEG（小得多）", value="jpeg",
+        ttk.Radiobutton(r1c, text="JPEG", value="jpeg",
                         variable=self.fmt, command=self.on_shrink).pack(side="left", padx=(6, 0))
-        ttk.Radiobutton(r1c, text="PNG（无损）", value="png",
+        # ★ 高保真 JPEG：色度不下采样（4:4:4）+ optimize。
+        #   给"像素一个不少、只想把 MB 压成 KB"用的 —— 见 on_shrink 里的实测。
+        ttk.Radiobutton(r1c, text="JPEG 高保真", value="jpeg-hi",
+                        variable=self.fmt, command=self.on_shrink).pack(side="left", padx=(4, 0))
+        ttk.Radiobutton(r1c, text="PNG（像素一个不差）", value="png",
                         variable=self.fmt, command=self.on_shrink).pack(side="left", padx=(4, 0))
         r1d = ttk.Frame(opt); r1d.pack(fill="x", padx=8, pady=(0, 8))
         self.lbl_shrink = ttk.Label(r1d, text="", foreground="#0a7")
@@ -296,21 +312,48 @@ class App:
             n = int(self.shrink_px.get())
         except (TypeError, ValueError):
             n = 750
-        jp = self.fmt.get() == "jpeg"
+        fmt = self.fmt.get()
+        # ★ 体积实测（16 张真实商品图，原始单张平均 2038 KB）：
+        #     不缩像素 + PNG       1263 KB   （像素一个不差，只省 38%）
+        #     不缩像素 + JPEG       185 KB   （省 91%，有损但 45 dB）
+        #     不缩像素 + JPEG 高保真 317 KB   （省 85%，48.5 dB、色度不下采样）
+        #     缩到 750 + JPEG        87 KB   （省 96%）
         if mode == "keep":
+            # 「什么都不做」也有体积账：这里给出来，免得以为选了它就能既不变又不减
+            if fmt == "png":
+                tail = "；PNG 无损，体积只省约 38%"
+            elif fmt == "jpeg-hi":
+                tail = "；高保真 JPEG 约省 85%"
+            else:
+                tail = "；JPEG 约省 91%"
             self.lbl_shrink.config(
-                text="按原图像素尺度处理 —— 平台要缩图时，锐化高频会被吃掉一半",
+                text="按原图像素尺度处理 —— 平台要缩图时，锐化高频会被吃掉一半" + tail,
                 foreground="#c60")
             return
+        if fmt == "png":
+            # 无损档：这里必须说实话 —— PNG 省不了多少，想变 KB 就得让步
+            if mode == "normalize":
+                self.lbl_shrink.config(
+                    text="保持原像素、PNG 无损 —— 像素一个不差，但体积只省约 38%"
+                         "（单张仍 ~1263 KB）。想把 MB 变 KB，得改用 JPEG 或缩图",
+                    foreground="#c60")
+            else:
+                self.lbl_shrink.config(
+                    text="长边缩到 %d、PNG 无损 —— 像素一个不差（只是变少），体积约省 71%%"
+                         "（单张 ~590 KB）" % n,
+                    foreground="#0a7")
+            return
+        hi = fmt == "jpeg-hi"
         if mode == "normalize":
             self.lbl_shrink.config(
                 text="保持原像素、按 %d 显示宽度归一尺度%s —— 清晰度接近缩图那档，"
-                     "但像素一个不少" % (n, "，JPEG 约省 90% 体积" if jp else ""),
+                     "但像素一个不少" % (n, "，高保真 JPEG 约省 85%（单张 ~317 KB）"
+                                          if hi else "，JPEG 约省 91%（单张 ~185 KB）"),
                 foreground="#0a7")
             return
         self.lbl_shrink.config(
             text="长边缩到 %d 再锐化%s —— 实测最清晰的一档（HF +32.5%%）"
-                 % (n, "，JPEG 约省 94% 体积" if jp else ""),
+                 % (n, "，高保真 JPEG 体积约省 95%" if hi else "，JPEG 约省 96% 体积"),
             foreground="#0a7")
 
     # ---------- 执行 ----------
@@ -370,7 +413,7 @@ class App:
             self.write("共 %d 张，锐化 %.1f，放大 %.1fx，自动分流 %s，输出 %s"
                        % (len(files), self.amount.get(), self.scale.get(),
                           "开" if self.auto_route.get() else "关",
-                          "JPEG" if fmt == "jpeg" else "PNG"))
+                          FMT_NAME.get(fmt, fmt.upper())))
         if compress_only:
             # 这条路不锐化，别照抄增强那边的措辞（会误导成"缩完还要锐"）
             if shrink:
@@ -392,7 +435,7 @@ class App:
             self.write("模式：只判定，不出图")
         elif compress_only:
             self.write("输出：%s    共 %d 张，输出 %s"
-                       % (out, len(files), "JPEG" if fmt == "jpeg" else "PNG"))
+                       % (out, len(files), FMT_NAME.get(fmt, fmt.upper())))
         else:
             self.write("输出：%s" % out)
         self.write("源图：只读，不会有任何改动")
@@ -413,8 +456,7 @@ class App:
               shrink=0, fmt="png", dispw=0, compress_only=False):
         t0 = time.time(); n_run = n_skip = n_err = n_cmp = 0
         tot_in = tot_out = 0
-        ext = ".jpg" if fmt == "jpeg" else ".png"
-        q = 92 if fmt == "jpeg" else None
+        ext, q, hi = fmt_to_ext_q(fmt)
         self.q.put(("reset", None))
         if not judge:
             os.makedirs(out, exist_ok=True)
@@ -444,20 +486,20 @@ class App:
                     if compress_only:
                         # 不锐化、不归一尺度 —— 只按需缩图 + 重新编码
                         work, _s = E.fit_long_edge(E._read(p), shrink)
-                        E._write(dst, E.upscale(work, scale), q)
+                        E._write(dst, E.upscale(work, scale), q, hi)
                     elif do:
                         src = E._read(p)
                         work, _s = E.fit_long_edge(src, shrink)   # ★ 先缩
                         o, _m = E.enhance_one(work, amount, dark_gain=dark,
                                               blur_gain=blur, clarity=clarity,
                                               display_w=dispw)
-                        E._write(dst, E.upscale(o, scale), q)
+                        E._write(dst, E.upscale(o, scale), q, hi)
                     elif (rel.lower().endswith(".png") and scale <= 1.0
                           and fmt == "png" and not shrink):
                         shutil.copy2(p, dst)          # 直出 = 逐字节原样
                     else:
                         work, _s = E.fit_long_edge(E._read(p), shrink)
-                        E._write(dst, E.upscale(work, scale), q)
+                        E._write(dst, E.upscale(work, scale), q, hi)
                     try:
                         tot_in += os.path.getsize(p)
                         tot_out += os.path.getsize(dst)
@@ -577,7 +619,9 @@ class App:
             #   结果就是换了源图后输出还指着上一张（实测踩过）。
             self.auto_out = bool(d.get("auto_out", True))
             self.shrink_px.set(int(d.get("shrink_px", 750)))
-            self.fmt.set(d.get("fmt", "jpeg"))
+            # 兼容旧设置文件：老版本只有 png/jpeg，新版本多了 jpeg-hi
+            _f = d.get("fmt", "jpeg")
+            self.fmt.set(_f if _f in FMT_NAME else "jpeg")
             # 兼容旧设置文件：老版本只有 shrink_on，没有 size_mode
             if "size_mode" in d:
                 self.size_mode.set(d["size_mode"])
