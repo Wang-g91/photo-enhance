@@ -8,6 +8,9 @@ _dud*.png
 __pycache__/
 *.pyc
 _*.json
+# 提交信息临时文件（git commit -F 用的，不属于工具本体）
+_commitmsg.txt
+_m*.txt
 out/
 *_增强/
 *_enh.png
