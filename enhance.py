@@ -443,10 +443,10 @@ def adaptive_sharpen(bgr, amount=2.0, radius=3, eps=0.0025, soft=0.010,
 # ============================================================================
 
 PRESETS = {
-    # ★ 「只压体积」不是"对照"，是正经功能（2026-10-01 用户口径）：
+    # ★ 「原风格压缩」不是"对照"，是正经功能（2026-10-01 用户口径）：
     #   "不用这预设原图风格压缩" —— 画面一个像素都不动，只把 MB 压成 KB。
     #   标记 plain=True，调用方据此走 compress_only 那条路，不做任何锐化。
-    "只压体积": {
+    "原风格压缩": {
         "desc": "不做任何增强，画面一个像素都不动 —— 只按尺寸策略重新编码，把 MB 压成 KB。"
                 "给「原图风格不能变、但文件太大」用。",
         "amount": 1.0, "dark_gain": 0.0, "blur_gain": 0.0,
@@ -843,7 +843,7 @@ def iter_images(root):
 
         所以：① 名字以 _增强 结尾的目录整个跳过（本工具的默认输出目录名）；
               ② 以 _enh.* / _压缩.* 结尾的文件跳过（本工具两种成品命名）；
-                 漏了 _压缩 那一类的话，「只压体积」跑第二次会把上一次的
+                 漏了 _压缩 那一类的话，「原风格压缩」跑第二次会把上一次的
                  成品当新输入，压上加压。
               ③ chk 类临时文件（.prep.）跳过（那是看图前的压缩副本）。
         三者都是本工具自己的产物，不该再被当输入。
@@ -859,7 +859,7 @@ def iter_images(root):
             if low.endswith("_enh.png") or low.endswith("_enh.jpg") or low.endswith("_enh.jpeg"):
                 continue                    # 本工具自己的成品
             if low.endswith("_压缩.png") or low.endswith("_压缩.jpg") or low.endswith("_压缩.jpeg"):
-                continue                    # 「只压体积」的成品
+                continue                    # 「原风格压缩」的成品
             yield os.path.join(dirpath, f)
 
 
@@ -892,7 +892,7 @@ def run_batch(indir, outdir, amount, judge_only, force, scale,
         #   人物/物件本身已经足够柔和，光看压缩后的观感很难分辨，
         #   所以需要一条"原图直接压缩"的基准线摆在一起比。
         if compress_only:
-            do, tag = False, "只压缩"
+            do, tag = False, "原风格压缩"
         else:
             do = force or v["verdict"] in ("run", "marginal")
             tag = "增强" if do else "直出"
@@ -946,9 +946,9 @@ def run_batch(indir, outdir, amount, judge_only, force, scale,
             w.writerows(rows)
     dt = time.time() - t_all
     if compress_only:
-        print("\n共 %d 张：只压缩 %d / 出错 %d     耗时 %.1fs（%.2fs/张）"
+        print("\n共 %d 张：原风格压缩 %d / 出错 %d     耗时 %.1fs（%.2fs/张）"
               % (len(files), n_cmp, n_err, dt, dt / max(1, len(files))))
-        print("★ 这一轮没有做任何增强（像素未改），只是重新编码 —— 用于对照")
+        print("★ 这一轮没有做任何增强（像素未改），只是重新编码")
     else:
         print("\n共 %d 张：增强 %d / 直出 %d / 出错 %d     耗时 %.1fs（%.2fs/张）"
               % (len(files), n_run, n_skip, n_err, dt, dt / max(1, len(files))))
@@ -997,7 +997,7 @@ def main():
     ap.add_argument("--report", action="store_true", help="打印各亮度档读数")
     ap.add_argument("--compress-only", action="store_true",
                     help="不做任何增强，只把原图重新编码（可配 --shrink/--format/--quality）。"
-                         "用于对照：看看「只压缩」和「增强后压缩」到底差多少")
+                         "两种用法：① 就是要这种成品；② 当基准线，看增强到底带来多少")
     ap.add_argument("--json", action="store_true", help="判定结果以 JSON 输出")
     ap.add_argument("--selftest", action="store_true", help="跑自检（不需要外部图）")
     a = ap.parse_args()
@@ -1023,7 +1023,7 @@ def main():
             amount = a.amount
         if a.scale != 1.0:
             scale = a.scale
-        # ★ 预设「只压体积」= 不做任何增强，只重新编码。
+        # ★ 预设「原风格压缩」= 不做任何增强，只重新编码。
         #   选它就该走 compress_only，别偷偷跑到锐化那条路上去。
         if p.get("plain"):
             a.compress_only = True
@@ -1058,7 +1058,7 @@ def main():
     hi = a.format == "jpeg-hi"
     ext = ".jpg" if is_jpg else ".png"
     base = os.path.splitext(os.path.basename(a.input))[0]
-    # ★ 只压缩走 _压缩 后缀，增强走 _enh —— 两条路可以落在同一个目录里，
+    # ★ 原风格压缩走 _压缩 后缀，增强走 _enh —— 两条路可以落在同一个目录里，
     #   互相不会覆盖，一眼能分出哪个是原风格压缩、哪个是增强过的。
     out_path = os.path.join(outdir, base + ("_压缩" if a.compress_only else "_enh") + ext)
     src = _read(a.input)
@@ -1067,7 +1067,7 @@ def main():
         # 只重新编码：不锐化、不归一尺度，像素级一个字节都不动（除非 --shrink/--scale）
         work, sfit = fit_long_edge(src, a.shrink)
         _write(out_path, upscale(work, scale), q, hi)
-        print("只压缩（未做任何增强）-> %s  (%.2fs)" % (out_path, time.time() - t0))
+        print("原风格压缩（未做任何增强）-> %s  (%.2fs)" % (out_path, time.time() - t0))
         if sfit < 1.0:
             print("       长边 %d -> %d px" % (max(src.shape[:2]), max(work.shape[:2])))
         print("       体积 %.0f KB -> %.0f KB"

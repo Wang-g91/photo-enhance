@@ -99,21 +99,31 @@ class App:
                                 command=self.on_preset)
             b.grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 22), pady=3)
             self.preset_boxes[name] = b
-            tips[name] = (p["desc"] + "\n锐化 %.1f ｜ 暗部加成 %.1f ｜ 糊区加成 %.1f ｜ 放大 %.1fx"
-                          % (p["amount"], p["dark_gain"], p["blur_gain"], p["scale"]))
+            if p.get("plain"):
+                # 这一档没有锐化参数可报，别拿"锐化 1.0 ｜ 暗部 0.0"去糊弄人
+                tips[name] = (p["desc"] + "\n不锐化 ｜ 不改颜色 ｜ 不改像素尺寸（默认）"
+                              "\n只按「尺寸策略 + 输出格式」重新编码")
+            else:
+                tips[name] = (p["desc"] + "\n锐化 %.1f ｜ 暗部加成 %.1f ｜ 糊区加成 %.1f ｜ 放大 %.1fx"
+                              % (p["amount"], p["dark_gain"], p["blur_gain"], p["scale"]))
             self._tooltip(b, tips[name])
 
         opt = ttk.LabelFrame(self.root, text="3. 微调（可选）")
         opt.pack(fill="x", **pad)
         r1 = ttk.Frame(opt); r1.pack(fill="x", padx=8, pady=6)
-        ttk.Label(r1, text="锐化强度").pack(side="left")
+        # ★ 这一行（锐化强度 / 放大）在「原风格压缩」下完全用不上，
+        #   所以存下来，切到那一档时整行藏掉 —— 见 _sync_plain()。
+        self.row_tune = r1
+        self.lbl_amt_cap = ttk.Label(r1, text="锐化强度")
+        self.lbl_amt_cap.pack(side="left")
         self.sl_amt = ttk.Scale(r1, from_=0.5, to=4.0, variable=self.amount,
                                 orient="horizontal", length=220,
                                 command=lambda *_: self.lbl_amt.config(
                                     text="%.1f" % self.amount.get()))
         self.sl_amt.pack(side="left", padx=8)
         self.lbl_amt = ttk.Label(r1, text="2.0", width=5); self.lbl_amt.pack(side="left")
-        ttk.Label(r1, text="   放大").pack(side="left")
+        self.lbl_scl_cap = ttk.Label(r1, text="   放大")
+        self.lbl_scl_cap.pack(side="left")
         self.sl_scl = ttk.Scale(r1, from_=1.0, to=4.0, variable=self.scale,
                                 orient="horizontal", length=160,
                                 command=lambda *_: self.lbl_scl.config(
@@ -121,12 +131,15 @@ class App:
         self.sl_scl.pack(side="left", padx=8)
         self.lbl_scl = ttk.Label(r1, text="1.0x", width=6); self.lbl_scl.pack(side="left")
         r1b = ttk.Frame(opt); r1b.pack(fill="x", padx=8, pady=(0, 6))
+        self.row_auto = r1b        # 同理：这一行在压缩档下也要藏
         self.ck_auto = ttk.Checkbutton(
             r1b, text="自动分流（白底平坦图直接原图直出，不浪费一次重编码）",
             variable=self.auto_route)
         self.ck_auto.pack(side="left")
-        ttk.Label(r1b, text="预设会覆盖右侧两个滑块；手动拖动滑块即改为自定义",
-                  foreground="#888").pack(side="left", padx=14)
+        self.lbl_auto_hint = ttk.Label(
+            r1b, text="预设会重置上面那两个滑块；手动拖动滑块即改为自定义",
+            foreground="#888")
+        self.lbl_auto_hint.pack(side="left", padx=14)
 
         # ★ 第 3.5 行：尺寸策略 + 格式。
         #   两种尺寸策略是等价的（都把处理尺度对齐到「平台显示宽度」），
@@ -134,6 +147,7 @@ class App:
         #     缩图   —— 文件小 94%，效果最好（实测 HF +32.5%）
         #     不缩图 —— 保留原始像素，效果接近（HF +27.7%，局部对比反而最高 +6.9%）
         r1c = ttk.Frame(opt); r1c.pack(fill="x", padx=8, pady=(0, 2))
+        self.row_size = r1c        # 尺寸策略行：压缩档下**不能**藏（它是真读的）
         ttk.Label(r1c, text="尺寸策略").pack(side="left")
         ttk.Radiobutton(r1c, text="缩到长边", value="shrink",
                         variable=self.size_mode, command=self.on_shrink).pack(side="left")
@@ -298,11 +312,38 @@ class App:
         self.lbl_amt.config(text="%.1f" % p["amount"])
         self.lbl_scl.config(text="%.1fx" % p["scale"])
         if p.get("plain"):
-            # ★ 「只压体积」档：不锐化、不改任何尺度，只重新编码。
+            # ★ 「原风格压缩」档：不锐化、不改任何尺度，只重新编码。
             #   选它的时候自动把尺寸策略踢到"保持原像素"，否则默认的"缩到长边"
             #   会悄悄把像素改掉 —— 那就不是"原图风格压缩"了。
             self.size_mode.set("normalize")
+        self._sync_plain()
         self.on_shrink()
+
+    def _sync_plain(self):
+        """「原风格压缩」档下，把用不上的控件整行藏掉。
+
+        ★ 为什么是藏掉而不是禁用：这一档不读锐化/放大/自动分流，
+          留在那儿只会让人以为"调了会有效果"。跟它无关的东西就不该出现在眼前。
+          尺寸策略和输出格式**保留** —— 那两样它是真读的。
+
+        ★ 复原时必须用 pack(before=...)：单纯 pack() 会把它塞到末尾，
+          行序就乱了（实测：复原后"锐化强度"跑到尺寸策略下面去了）。
+        """
+        plain = bool(E.apply_preset(self.preset.get()).get("plain"))
+        tune, auto, size = (getattr(self, "row_tune", None),
+                            getattr(self, "row_auto", None),
+                            getattr(self, "row_size", None))
+        if tune is None or auto is None or size is None:
+            return
+        if plain:
+            tune.pack_forget()
+            auto.pack_forget()
+            return
+        # 顺序：tune -> auto -> size。都用 before=size 插，先插的在前
+        if not tune.winfo_manager():
+            tune.pack(fill="x", padx=8, pady=6, before=size)
+        if not auto.winfo_manager():
+            auto.pack(fill="x", padx=8, pady=(0, 6), before=size)
 
     def on_shrink(self):
         """把当前尺寸策略翻译成一句人话，实时显示。
@@ -319,6 +360,24 @@ class App:
         except (TypeError, ValueError):
             n = 750
         fmt = self.fmt.get()
+        # ★ 压缩档不锐化，措辞不能照抄增强那套（"归一尺度""再锐化"都无从谈起）。
+        #   它只关心两件事：尺寸变不变、体积省多少。
+        if E.apply_preset(self.preset.get()).get("plain"):
+            if mode == "shrink":
+                self.lbl_shrink.config(
+                    text="长边缩到 %d px 再编码（不锐化）—— %s"
+                         % (n, {"png": "PNG 无损，单张 ~681 KB",
+                                "jpeg-hi": "高保真 JPEG，单张 ~143 KB",
+                                "jpeg": "JPEG，单张 ~87 KB"}[fmt]),
+                    foreground="#0a7")
+            else:
+                self.lbl_shrink.config(
+                    text="像素尺寸原样保留，只重新编码 —— %s"
+                         % {"png": "PNG 无损，单张 ~1557 KB（几 MB 压不到 KB 级）",
+                            "jpeg-hi": "高保真 JPEG，单张 ~317 KB（省约 84%）",
+                            "jpeg": "JPEG，单张 ~185 KB（省约 91%）"}[fmt],
+                    foreground="#c60" if fmt == "png" else "#0a7")
+            return
         # ★ 体积实测（16 张真实商品图，原始单张平均 2038 KB）：
         #     不缩像素 + PNG       1263 KB   （像素一个不差，只省 38%）
         #     不缩像素 + JPEG       185 KB   （省 91%，有损但 45 dB）
@@ -401,8 +460,8 @@ class App:
         dark = p["dark_gain"] if self.preset.get() != "推荐" else 0.0
         blur = p["blur_gain"] if self.preset.get() != "推荐" else 0.0
         clarity = float(p.get("clarity", 0.0))
-        # ★ 选了「只压体积」档 = 走 compress_only 那条路（不锐化）。
-        #   这样用户只要"选预设 + 点开始"，不用另外去按「只压缩」按钮。
+        # ★ 选了「原风格压缩」档 = 走 compress_only 那条路（不锐化）。
+        #   这样用户只要"选预设 + 点开始"，不用另外去按「原风格压缩」按钮。
         if p.get("plain") and not judge:
             compress_only = True
         # ★ 尺寸策略（见 enhance.fit_long_edge / enhance_one 的 display_w）。
@@ -417,9 +476,9 @@ class App:
         fmt = self.fmt.get()
         self.write("=" * 66)
         if compress_only:
-            # 两条来路共用这条路：① 预设「只压体积」；② 按钮「只压缩（对照）」
-            src_tag = ("预设「只压体积」" if p.get("plain")
-                       else "只压缩（对照）")
+            # 两条来路共用这条路：① 预设「原风格压缩」；② 按钮「原风格压缩」
+            src_tag = ("预设「原风格压缩」" if p.get("plain")
+                       else "原风格压缩")
             self.write("★ %s —— 不做任何增强，画面一个像素都不动，"
                        "只按下面的尺寸/格式重新编码" % src_tag)
         else:
@@ -484,7 +543,7 @@ class App:
                 n_err += 1; self.q.put(("pb", i)); continue
             do = (not auto) or v["verdict"] in ("run", "marginal")
             if compress_only:
-                self.q.put(("log", "[%d/%d] 只压缩   %s"
+                self.q.put(("log", "[%d/%d] 原风格压缩   %s"
                             % (i, len(files), os.path.basename(p))))
             else:
                 self.q.put(("log", "[%d/%d] %-8s %s  带内 %.3f  链路 %+.1f%%   %s"
@@ -493,7 +552,7 @@ class App:
                                os.path.basename(p))))
             if not judge:
                 rel = os.path.basename(p)
-                # ★ 只压缩走 _压缩 后缀，增强走 _enh —— 两条路可以落在同一个目录里，
+                # ★ 原风格压缩走 _压缩 后缀，增强走 _enh —— 两条路可以落在同一个目录里，
                 #   一眼分出哪个是原风格压缩、哪个是增强过的
                 dst = os.path.join(out, os.path.splitext(rel)[0]
                                    + ("_压缩" if compress_only else "_enh") + ext)
@@ -531,7 +590,7 @@ class App:
                             self.q.put(("log", "        " + ln.strip()))
                     n_err += 1
                 rows.append([rel, v["verdict"],
-                             "只压缩" if compress_only else ("增强" if do else "直出"),
+                             "原风格压缩" if compress_only else ("增强" if do else "直出"),
                              "%.3f" % v["band_ratio"], "%.3f" % v["mask_cov"],
                              "%+.1f%%" % (v["hf_gain_chain"] * 100)])
             if compress_only:
@@ -544,7 +603,7 @@ class App:
             import csv
             # ★ 两条路各写各的报告：写进同一个目录时不能互相覆盖，
             #   否则后跑的那次会把前一次的读数冲掉，就没法对着看了。
-            rp = os.path.join(out, "_处理报告_只压缩.csv" if compress_only
+            rp = os.path.join(out, "_处理报告_原风格压缩.csv" if compress_only
                               else "_处理报告.csv")
             with open(rp, "w", newline="", encoding="utf-8-sig") as f:
                 csv.writer(f).writerows(rows)
@@ -552,9 +611,9 @@ class App:
         dt = time.time() - t0
         self.q.put(("log", "-" * 66))
         if compress_only:
-            self.q.put(("log", "完成：只压缩 %d / 出错 %d，用时 %.1fs（%.2fs/张）"
+            self.q.put(("log", "完成：原风格压缩 %d / 出错 %d，用时 %.1fs（%.2fs/张）"
                         % (n_cmp, n_err, dt, dt / max(1, len(files)))))
-            self.q.put(("log", "★ 这一轮没有做任何增强（像素未改），只是重新编码 —— 用于对照"))
+            self.q.put(("log", "★ 这一轮没有做任何增强（像素未改），只是重新编码"))
         else:
             self.q.put(("log", "完成：增强 %d / 直出 %d / 出错 %d，用时 %.1fs（%.2fs/张）"
                         % (n_run, n_skip, n_err, dt, dt / max(1, len(files)))))
@@ -644,6 +703,10 @@ class App:
                 self.size_mode.set("shrink" if d.get("shrink_on") else "keep")
             self.lbl_amt.config(text="%.1f" % self.amount.get())
             self.lbl_scl.config(text="%.1fx" % self.scale.get())
+            # ★ 必须调一次：上次退出时如果停在「原风格压缩」档，
+            #   开机就得把用不上的控件收起来。漏了这行的话，重启后
+            #   界面又会把"锐化强度"摆出来（实测踩过）。
+            self._sync_plain()
             self.on_shrink()
         except Exception:                              # noqa: BLE001
             pass
