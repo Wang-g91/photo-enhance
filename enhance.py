@@ -559,8 +559,21 @@ def measure(path, width=750, amount=2.0, cap=2048):
 # ============================================================================
 
 def enhance_one(bgr, amount=2.0, obj_mode="original",
-                dark_gain=0.0, blur_gain=0.0, cap=1.6, clarity=0.0):
+                dark_gain=0.0, blur_gain=0.0, cap=1.6, clarity=0.0,
+                display_w=0):
     """返回 (成品, 遮罩)。
+
+    display_w —— 「这张图最终会以多宽展示」。给了它且原图比它宽时，
+        所有**尺度相关**的参数（锐化半径、过冲容差、梯度门限、clarity 的窗）
+        会按 display_w/原图宽 的比例放大，让处理在**显示尺度**上生效，
+        而像素尺寸保持原样、一个像素都不缩。
+        ★ 它是"不缩图也保得住效果"的那条路：平台把 1200 缩到 750 展示时，
+          在 1200 上锐化出来的高频大半被重采样吃掉（实测只剩一半），
+          把半径同步放大到显示尺度，缩完剩下的才等于"直接在 750 上锐化"。
+        16 张真实商品图实测（都换算到 750 显示尺寸量）：
+            不缩放半径（旧）      HF +20.6%   局部对比 +3.9%
+            缩到 750 再锐化       HF +32.5%   局部对比 +5.2%
+            不缩像素 + 半径归一   HF +27.7%   局部对比 +6.9%  ← 局部对比最高
 
     默认档（obj_mode="original"）：
         人物/主体区 = 门限保边锐化；暗且中性的物件区 = 原图像素，一个字节都不动。
@@ -586,19 +599,32 @@ def enhance_one(bgr, amount=2.0, obj_mode="original",
     """
     m = object_mask(bgr)
     adaptive = dark_gain > 0 or blur_gain > 0
+    # ★ 尺度归一：把"3 像素半径"这类固定尺度换算到显示尺度上。
+    #   只放大不缩小（s >= 1）—— 原图比显示宽度还小时没必要动，
+    #   那种情况平台不会缩，处理尺度本来就是对的。
+    s = 1.0
+    if display_w and display_w > 0:
+        w = bgr.shape[1]
+        if w > display_w:
+            s = float(w) / float(display_w)
     if adaptive and obj_mode == "original":
         # 物件区不参与基础锐化，但暗部/糊区该拿的加成照拿
-        out = adaptive_sharpen(bgr, amount, 3, 0.0025, soft=0.0,
+        out = adaptive_sharpen(bgr, amount, max(1, int(round(3 * s))), 0.0025, soft=0.0,
                                dark_gain=dark_gain, blur_gain=blur_gain,
-                               cap=cap, protect=m)
+                               cap=cap, protect=m,
+                               tol=0.004 * s, t0n=0.075 / s, t1n=0.34 / s)
         if clarity > 0:
-            out = clarity_boost(out, clarity)
+            out = clarity_boost(out, clarity, r_small=max(2, int(round(4 * s))),
+                                r_big=max(8, int(round(32 * s))),
+                                win=max(3, int(round(9 * s)) | 1))
         return out, m
     if adaptive:
-        sharp = adaptive_sharpen(bgr, amount, 3, 0.0025, soft=0.0,
-                                 dark_gain=dark_gain, blur_gain=blur_gain, cap=cap)
+        sharp = adaptive_sharpen(bgr, amount, max(1, int(round(3 * s))), 0.0025, soft=0.0,
+                                 dark_gain=dark_gain, blur_gain=blur_gain, cap=cap,
+                                 tol=0.004 * s, t0n=0.075 / s, t1n=0.34 / s)
     else:
-        sharp = sharpen_edges(bgr, amount, 3, 0.0025, 0.045, 0.20, 0.004)
+        sharp = sharpen_edges(bgr, amount, max(1, int(round(3 * s))), 0.0025,
+                              0.045 / s, 0.20 / s, 0.004 * s)
     if obj_mode == "original":
         obj = bgr
     else:
@@ -811,7 +837,7 @@ def iter_images(root):
 
 def run_batch(indir, outdir, amount, judge_only, force, scale,
               dark_gain=0.0, blur_gain=0.0, clarity=0.0,
-              shrink=0, fmt="png", quality=92):
+              shrink=0, fmt="png", quality=92, display_w=0):
     files = list(iter_images(indir))
     if not files:
         print("[X] 目录里没找到图: " + indir)
@@ -844,7 +870,8 @@ def run_batch(indir, outdir, amount, judge_only, force, scale,
                 #   高频采掉（实测剩下的不到一半），见 fit_long_edge 的注释。
                 work, _s = fit_long_edge(src, shrink)
                 out, _m = enhance_one(work, amount, dark_gain=dark_gain,
-                                      blur_gain=blur_gain, clarity=clarity)
+                                      blur_gain=blur_gain, clarity=clarity,
+                                      display_w=display_w)
                 _write(out_path, upscale(out, scale), q)
             elif os.path.splitext(p)[1].lower() == ".png" and scale <= 1.0:
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -902,6 +929,10 @@ def main():
     ap.add_argument("--shrink", type=int, default=0, metavar="N",
                     help="先把长边缩到 N 像素再锐化（推荐 750 或 900）。"
                          "★ 缩图必须在锐化之前 —— 顺序反了效果会被平台缩放吃掉一半")
+    ap.add_argument("--display-width", type=int, default=0, metavar="N",
+                    help="不缩像素时的等效显示宽度（如 750）。给了它就不缩图，"
+                         "改成把所有尺度参数换算到该宽度 —— 效果与「缩到 N 再锐化」相当，"
+                         "但保留原始像素。与 --shrink 二选一")
     ap.add_argument("--format", choices=("png", "jpeg"), default="png",
                     help="输出格式（默认 png 无损）。jpeg 体积小得多，肉眼几乎无差")
     ap.add_argument("--quality", type=int, default=92,
@@ -944,7 +975,7 @@ def main():
         outdir = a.output or (a.input.rstrip("\\/") + "_增强")
         return run_batch(a.input, outdir, amount, a.judge, a.force, scale,
                          dark_gain, blur_gain, clarity,
-                         a.shrink, a.format, a.quality)
+                         a.shrink, a.format, a.quality, a.display_width)
     if not os.path.isfile(a.input):
         print("[X] 找不到: " + a.input)
         return 1
@@ -971,12 +1002,16 @@ def main():
     if do:
         work, sfit = fit_long_edge(src, a.shrink)
         out, m = enhance_one(work, amount, a.obj_mode, dark_gain=dark_gain,
-                             blur_gain=blur_gain, clarity=clarity)
+                             blur_gain=blur_gain, clarity=clarity,
+                             display_w=a.display_width)
         _write(out_path, upscale(out, scale), q)
         print("完成 -> %s  (%.2fs)" % (out_path, time.time() - t0))
         if sfit < 1.0:
             print("       长边 %d -> %d px（先缩后锐，效果优于先锐后缩）"
                   % (max(src.shape[:2]), max(out.shape[:2])))
+        elif a.display_width and max(src.shape[:2]) > a.display_width:
+            print("       像素保持 %d px，尺度按 %d px 显示宽度归一（不缩像素也保得住效果）"
+                  % (max(src.shape[:2]), a.display_width))
         print("       体积 %.0f KB -> %.0f KB"
               % (os.path.getsize(a.input) / 1024.0, os.path.getsize(out_path) / 1024.0))
         if a.report:

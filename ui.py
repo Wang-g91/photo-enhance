@@ -46,9 +46,11 @@ class App:
         self.amount = tk.DoubleVar(value=2.0)
         self.scale = tk.DoubleVar(value=1.0)
         self.auto_route = tk.BooleanVar(value=True)
-        # ★ 缩图 + 出 JPEG：实测这是"效果更好 + 文件更小"的唯一组合，
-        #   因为缩图必须发生在锐化之前（见 enhance.fit_long_edge 的注释）。
-        self.shrink_on = tk.BooleanVar(value=True)
+        # ★ 尺寸策略：把处理尺度对齐到"平台显示宽度"（见 enhance.fit_long_edge）。
+        #   shrink    = 真缩像素（最小、效果最好）
+        #   normalize = 不缩像素，只把半径/门限换算到该宽度（保留原像素）
+        #   keep      = 都不做，按原图尺度处理（历史行为）
+        self.size_mode = tk.StringVar(value="shrink")
         self.shrink_px = tk.IntVar(value=750)
         self.fmt = tk.StringVar(value="jpeg")
         self.busy = False
@@ -114,22 +116,33 @@ class App:
         ttk.Label(r1b, text="预设会覆盖右侧两个滑块；手动拖动滑块即改为自定义",
                   foreground="#888").pack(side="left", padx=14)
 
-        # ★ 第 3.5 行：缩小 + 格式。这两个是"效果更好还更小"的关键，
-        #   默认就开着 —— 因为绝大多数平台的显示宽度就是 750 左右。
-        r1c = ttk.Frame(opt); r1c.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Checkbutton(r1c, text="先缩到长边", variable=self.shrink_on,
-                        command=self.on_shrink).pack(side="left")
+        # ★ 第 3.5 行：尺寸策略 + 格式。
+        #   两种尺寸策略是等价的（都把处理尺度对齐到「平台显示宽度」），
+        #   区别只在要不要真的缩像素：
+        #     缩图   —— 文件小 94%，效果最好（实测 HF +32.5%）
+        #     不缩图 —— 保留原始像素，效果接近（HF +27.7%，局部对比反而最高 +6.9%）
+        r1c = ttk.Frame(opt); r1c.pack(fill="x", padx=8, pady=(0, 2))
+        ttk.Label(r1c, text="尺寸策略").pack(side="left")
+        ttk.Radiobutton(r1c, text="缩到长边", value="shrink",
+                        variable=self.size_mode, command=self.on_shrink).pack(side="left")
         self.cmb_px = ttk.Combobox(r1c, textvariable=self.shrink_px, width=6,
                                    values=("600", "750", "900", "1080", "1200"))
         self.cmb_px.pack(side="left", padx=4)
-        ttk.Label(r1c, text="px 再锐化").pack(side="left")
+        ttk.Label(r1c, text="px").pack(side="left")
         self.cmb_px.bind("<<ComboboxSelected>>", lambda _e: self.on_shrink())
+        ttk.Radiobutton(r1c, text="保持原像素，按该宽度归一", value="normalize",
+                        variable=self.size_mode,
+                        command=self.on_shrink).pack(side="left", padx=(12, 0))
+        ttk.Radiobutton(r1c, text="都不做", value="keep",
+                        variable=self.size_mode,
+                        command=self.on_shrink).pack(side="left", padx=(8, 0))
         ttk.Label(r1c, text="   ｜ 输出格式").pack(side="left", padx=(10, 0))
         ttk.Radiobutton(r1c, text="JPEG（小得多）", value="jpeg",
-                        variable=self.fmt).pack(side="left", padx=(6, 0))
+                        variable=self.fmt, command=self.on_shrink).pack(side="left", padx=(6, 0))
         ttk.Radiobutton(r1c, text="PNG（无损）", value="png",
-                        variable=self.fmt).pack(side="left", padx=(4, 0))
-        self.lbl_shrink = ttk.Label(r1c, text="", foreground="#0a7")
+                        variable=self.fmt, command=self.on_shrink).pack(side="left", padx=(4, 0))
+        r1d = ttk.Frame(opt); r1d.pack(fill="x", padx=8, pady=(0, 8))
+        self.lbl_shrink = ttk.Label(r1d, text="", foreground="#0a7")
         self.lbl_shrink.pack(side="left", padx=12)
 
         out = ttk.LabelFrame(self.root, text="4. 输出到（原图绝不会被改动）")
@@ -265,22 +278,34 @@ class App:
         self.lbl_scl.config(text="%.1fx" % p["scale"])
 
     def on_shrink(self):
-        """更新"省多少"的实时提示 —— 让人一眼看到缩图不是白缩。
+        """把当前尺寸策略翻译成一句人话，实时显示。
 
-        数字来自 enhance.fit_long_edge 的实测（四张真实商品图）：
-        先缩后锐的 HF 增益比"先锐后缩"高约 1.5~1.8 倍，同时体积小 4~5 倍。
+        数字来自 enhance.enhance_one / fit_long_edge 的实测（16 张真实商品图，
+        都换算到 750 显示宽度量）：
+            不缩放尺度（历史）    HF +20.6%   局部对比 +3.9%
+            缩到 750 再锐化       HF +32.5%   局部对比 +5.2%
+            不缩像素 + 尺度归一   HF +27.7%   局部对比 +6.9%
         """
-        if not self.shrink_on.get():
-            self.lbl_shrink.config(text="不缩图（输出与原图同尺寸）", foreground="#888")
-            return
+        mode = self.size_mode.get()
         try:
             n = int(self.shrink_px.get())
         except (TypeError, ValueError):
             n = 750
         jp = self.fmt.get() == "jpeg"
+        if mode == "keep":
+            self.lbl_shrink.config(
+                text="按原图像素尺度处理 —— 平台要缩图时，锐化高频会被吃掉一半",
+                foreground="#c60")
+            return
+        if mode == "normalize":
+            self.lbl_shrink.config(
+                text="保持原像素、按 %d 显示宽度归一尺度%s —— 清晰度接近缩图那档，"
+                     "但像素一个不少" % (n, "，JPEG 约省 90% 体积" if jp else ""),
+                foreground="#0a7")
+            return
         self.lbl_shrink.config(
-            text="长边缩到 %d 再锐化%s —— 实测比先锐后缩清晰 1.5~1.8 倍"
-                 % (n, "，JPEG 约省 90% 体积" if jp else ""),
+            text="长边缩到 %d 再锐化%s —— 实测最清晰的一档（HF +32.5%%）"
+                 % (n, "，JPEG 约省 94% 体积" if jp else ""),
             foreground="#0a7")
 
     # ---------- 执行 ----------
@@ -322,12 +347,15 @@ class App:
         dark = p["dark_gain"] if self.preset.get() != "推荐" else 0.0
         blur = p["blur_gain"] if self.preset.get() != "推荐" else 0.0
         clarity = float(p.get("clarity", 0.0))
-        # ★ 缩图必须在锐化之前做（见 enhance.fit_long_edge）。
+        # ★ 尺寸策略（见 enhance.fit_long_edge / enhance_one 的 display_w）。
         #   tkinter 变量的读取一律留在主线程，只把值传进工作线程。
+        mode = self.size_mode.get()
         try:
-            shrink = int(self.shrink_px.get()) if self.shrink_on.get() else 0
+            px = int(self.shrink_px.get())
         except (TypeError, ValueError):
-            shrink = 750
+            px = 750
+        shrink = px if mode == "shrink" else 0
+        dispw = px if mode == "normalize" else 0
         fmt = self.fmt.get()
         self.write("=" * 66)
         self.write("预设「%s」：%s" % (self.preset.get(), p["desc"]))
@@ -337,8 +365,11 @@ class App:
                       "JPEG" if fmt == "jpeg" else "PNG"))
         if shrink:
             self.write("先缩到长边 %d px 再锐化 —— 比先锐后缩更清晰，文件也更小" % shrink)
+        elif dispw:
+            self.write("保持原始像素，把锐化尺度按 %d px 显示宽度归一 —— "
+                       "平台缩图后剩下的清晰度接近「缩图再锐化」那档" % dispw)
         else:
-            self.write("不缩图，按原尺寸处理")
+            self.write("按原图像素尺度处理（历史行为）")
         if clarity > 0:
             # ★ 唯一会改观感的一档 —— 必须提前说清楚，别让用户自己发现
             self.write("⚠ 这一档会拉开明暗对比（不是纯锐化），观感会变、强边处有极轻微光晕。"
@@ -357,12 +388,12 @@ class App:
             target=self._work,
             args=(files, out, judge, dark, blur, clarity,
                   float(self.amount.get()), float(self.scale.get()),
-                  bool(self.auto_route.get()), shrink, fmt),
+                  bool(self.auto_route.get()), shrink, fmt, dispw),
             daemon=True)
         t.start()
 
     def _work(self, files, out, judge, dark, blur, clarity, amount, scale, auto,
-              shrink=0, fmt="png"):
+              shrink=0, fmt="png", dispw=0):
         t0 = time.time(); n_run = n_skip = n_err = 0
         tot_in = tot_out = 0
         ext = ".jpg" if fmt == "jpeg" else ".png"
@@ -391,7 +422,8 @@ class App:
                         src = E._read(p)
                         work, _s = E.fit_long_edge(src, shrink)   # ★ 先缩
                         o, _m = E.enhance_one(work, amount, dark_gain=dark,
-                                              blur_gain=blur, clarity=clarity)
+                                              blur_gain=blur, clarity=clarity,
+                                              display_w=dispw)
                         E._write(dst, E.upscale(o, scale), q)
                     elif (rel.lower().endswith(".png") and scale <= 1.0
                           and fmt == "png" and not shrink):
@@ -483,9 +515,9 @@ class App:
                 json.dump({"preset": self.preset.get(), "amount": self.amount.get(),
                            "scale": self.scale.get(), "auto": self.auto_route.get(),
                            "output": self.output.get(),
-                           "shrink_on": self.shrink_on.get(),
                            "shrink_px": self.shrink_px.get(),
                            "fmt": self.fmt.get(),
+                           "size_mode": self.size_mode.get(),
                            "auto_out": bool(getattr(self, "auto_out", True))},
                           f, ensure_ascii=False, indent=2)
         except Exception:                              # noqa: BLE001
@@ -505,9 +537,13 @@ class App:
             #   光看目录是否为空判断不出来 —— 自动生成的目录也有内容，
             #   结果就是换了源图后输出还指着上一张（实测踩过）。
             self.auto_out = bool(d.get("auto_out", True))
-            self.shrink_on.set(bool(d.get("shrink_on", True)))
             self.shrink_px.set(int(d.get("shrink_px", 750)))
             self.fmt.set(d.get("fmt", "jpeg"))
+            # 兼容旧设置文件：老版本只有 shrink_on，没有 size_mode
+            if "size_mode" in d:
+                self.size_mode.set(d["size_mode"])
+            elif "shrink_on" in d:
+                self.size_mode.set("shrink" if d.get("shrink_on") else "keep")
             self.lbl_amt.config(text="%.1f" % self.amount.get())
             self.lbl_scl.config(text="%.1fx" % self.scale.get())
             self.on_shrink()
