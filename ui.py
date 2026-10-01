@@ -485,7 +485,10 @@ class App:
             self.q.put(("pb", i))
         if not judge:
             import csv
-            rp = os.path.join(out, "_处理报告.csv")
+            # ★ 两条路各写各的报告：写进同一个目录时不能互相覆盖，
+            #   否则后跑的那次会把前一次的读数冲掉，就没法对着看了。
+            rp = os.path.join(out, "_处理报告_只压缩.csv" if compress_only
+                              else "_处理报告.csv")
             with open(rp, "w", newline="", encoding="utf-8-sig") as f:
                 csv.writer(f).writerows(rows)
             self.q.put(("log", "报告 -> %s" % rp))
