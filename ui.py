@@ -48,6 +48,8 @@ class App:
         self.auto_route = tk.BooleanVar(value=True)
         self.busy = False
         self.q = queue.Queue()
+        self.made = []            # 这次跑出来/直出的文件，最后一个就是"最新结果"
+        self.auto_out = True      # 输出目录是否"跟着源图自动变"
 
         self._build()
         self._load()
@@ -111,7 +113,7 @@ class App:
         r2 = ttk.Frame(out); r2.pack(fill="x", padx=8, pady=6)
         ttk.Entry(r2, textvariable=self.output).pack(side="left", fill="x", expand=True)
         ttk.Button(r2, text="换目录…", command=self.pick_out).pack(side="left", padx=6)
-        ttk.Button(r2, text="打开", command=self.open_out).pack(side="left")
+        ttk.Button(r2, text="打开目录", command=self.open_out).pack(side="left")
 
         run = ttk.Frame(self.root); run.pack(fill="x", **pad)
         self.btn = ttk.Button(run, text="开始处理", command=self.start)
@@ -119,6 +121,12 @@ class App:
         ttk.Button(run, text="只判定不出图", command=lambda: self.start(judge=True)).pack(
             side="left", padx=6)
         ttk.Button(run, text="跑自检", command=self.selftest).pack(side="left", padx=6)
+        # ★ 跑完一键看结果：直接拿系统默认看图程序打开最新的那张，不用自己翻目录
+        self.btn_look = ttk.Button(run, text="看最新结果", command=self.open_latest,
+                                   state="disabled")
+        self.btn_look.pack(side="left", padx=(18, 4))
+        self.lbl_made = ttk.Label(run, text="", foreground="#888")
+        self.lbl_made.pack(side="left")
         self.pb = ttk.Progressbar(run, mode="determinate", length=260)
         self.pb.pack(side="right")
 
@@ -171,6 +179,7 @@ class App:
         self.inputs = []
         self.lbl_in.config(text="还没选")
         self.output.set("")
+        self.auto_out = True       # 清空后，输出目录回到"自动跟随"状态
 
     def _after_pick(self):
         files, is_dir = collect(self.inputs[0]) if len(self.inputs) == 1 else (self.inputs, False)
@@ -181,15 +190,24 @@ class App:
             self.lbl_in.config(text="文件夹：%d 张图" % len(files))
         else:
             self.lbl_in.config(text="已选 %d 张图" % len(files))
-        if not self.output.get():
-            base = os.path.basename(self.inputs[0].rstrip("\\/"))
-            parent = os.path.dirname(self.inputs[0].rstrip("\\/")) or HERE
+        # ★ 换了源就跟着换输出目录（2026-10-01 修）：
+        #   老逻辑只在输出为空时才填，于是"换了一张图，输出还指着上一张的目录"——
+        #   结果就是上一张的成品混在同一个文件夹里，看着像"没重跑"。
+        #   只有在用户自己选过/改过目录时才不覆盖（auto_out=False）。
+        if getattr(self, "auto_out", True):
+            src0 = self.inputs[0].rstrip("\\/")
+            base = os.path.basename(src0)
+            parent = os.path.dirname(src0) or HERE
+            # 单张图：去掉扩展名再拼 _增强，免得出现 "xxx.png_增强" 这种别扭名字
+            if not is_dir:
+                base = os.path.splitext(base)[0]
             self.output.set(os.path.join(parent, base + "_增强"))
 
     def pick_out(self):
         d = filedialog.askdirectory(title="输出目录")
         if d:
             self.output.set(d)
+            self.auto_out = False       # 用户自己选的，之后不跟着源图变
 
     def open_out(self):
         p = self.output.get()
@@ -197,6 +215,24 @@ class App:
             os.startfile(p)
         else:
             messagebox.showinfo("提示", "还没有输出目录")
+
+    def open_latest(self):
+        """用系统默认看图程序打开这次跑出来的最新一张。
+
+        为什么要有这个按钮：跑完先想看效果，得自己记路径、开资源管理器、翻目录 ——
+        尤其批量跑几百张时。这个按钮直接开最后一张（也支持多选：按住 Ctrl 点按钮
+        没意义，这里是开最新的，想看别的用「打开目录」）。
+        """
+        alive = [p for p in self.made if os.path.isfile(p)]
+        if not alive:
+            messagebox.showinfo("提示", "还没有跑出图。先选图再点「开始处理」。")
+            return
+        target = alive[-1]
+        try:
+            os.startfile(target)
+        except OSError as exc:                          # noqa: BLE001
+            # 没有关联的看图程序时才走到这
+            messagebox.showwarning("打不开", "%s\n\n可以点「打开目录」自己看。" % exc)
 
     def on_preset(self):
         p = E.apply_preset(self.preset.get())
@@ -267,6 +303,7 @@ class App:
 
     def _work(self, files, out, judge, dark, blur, amount, scale, auto):
         t0 = time.time(); n_run = n_skip = n_err = 0
+        self.q.put(("reset", None))
         if not judge:
             os.makedirs(out, exist_ok=True)
             rows = [["文件", "判定", "动作", "带内占比", "主体遮罩", "链路增益"]]
@@ -294,8 +331,16 @@ class App:
                         shutil.copy2(p, dst)          # 直出 = 逐字节原样
                     else:
                         E._write(dst, E.upscale(E._read(p), scale))
+                    self.q.put(("made", dst))         # 「看最新结果」认的就是它
                 except Exception as exc:              # noqa: BLE001
-                    self.q.put(("log", "    写出失败：%s" % str(exc)[:80])); n_err += 1
+                    # ★ 错误不能截断着给人猜（实测：[:80] 正好切在路径中间，
+                    #   看着像"路径太长/非法参数"，其实是被占用）。
+                    #   所以逐行铺开打，路径给全。
+                    self.q.put(("log", "    [X] 处理失败，这张没有输出"))
+                    for ln in str(exc).splitlines():
+                        if ln.strip():
+                            self.q.put(("log", "        " + ln.strip()))
+                    n_err += 1
                 rows.append([rel, v["verdict"], "增强" if do else "直出",
                              "%.3f" % v["band_ratio"], "%.3f" % v["mask_cov"],
                              "%+.1f%%" % (v["hf_gain_chain"] * 100)])
@@ -335,10 +380,21 @@ class App:
                     self.write(val)
                 elif kind == "pb":
                     self.pb.config(value=val)
+                elif kind == "reset":
+                    self.made = []
+                    self.btn_look.config(state="disabled")
+                    self.lbl_made.config(text="")
+                elif kind == "made":
+                    self.made.append(val)
+                    self.btn_look.config(state="normal")
+                    self.lbl_made.config(
+                        text="共 %d 张" % len(self.made) if len(self.made) > 1 else "")
                 elif kind == "done":
                     self.busy = False
                     self.btn.config(state="normal")
                     self._save()
+                    if self.made:
+                        self.write("已产出 %d 张 —— 点「看最新结果」直接打开。" % len(self.made))
         except queue.Empty:
             pass
         self.root.after(80, self._pump)
@@ -349,7 +405,9 @@ class App:
             with open(SETTINGS, "w", encoding="utf-8") as f:
                 json.dump({"preset": self.preset.get(), "amount": self.amount.get(),
                            "scale": self.scale.get(), "auto": self.auto_route.get(),
-                           "output": self.output.get()}, f, ensure_ascii=False, indent=2)
+                           "output": self.output.get(),
+                           "auto_out": bool(getattr(self, "auto_out", True))},
+                          f, ensure_ascii=False, indent=2)
         except Exception:                              # noqa: BLE001
             pass
 
@@ -363,6 +421,10 @@ class App:
             self.scale.set(float(d.get("scale", 1.0)))
             self.auto_route.set(bool(d.get("auto", True)))
             self.output.set(d.get("output", ""))
+            # ★ auto_out 单独存：区分"目录是自动生成的"还是"用户自己选的"。
+            #   光看目录是否为空判断不出来 —— 自动生成的目录也有内容，
+            #   结果就是换了源图后输出还指着上一张（实测踩过）。
+            self.auto_out = bool(d.get("auto_out", True))
             self.lbl_amt.config(text="%.1f" % self.amount.get())
             self.lbl_scl.config(text="%.1fx" % self.scale.get())
         except Exception:                              # noqa: BLE001

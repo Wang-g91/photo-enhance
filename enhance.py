@@ -42,13 +42,45 @@ def _read(path):
 
 
 def _write(path, bgr):
-    """写图（同上，支持中文路径）。"""
+    """写图（同上，支持中文路径）。
+
+    ★ 为什么不用 numpy 的 buf.tofile(path)（实战踩过，2026-10-01）：
+        任务栏里看到「写出失败：[Errno 22] Invalid argument: 'E:/xm/…'」，
+        可去目录一看 —— **文件明明写出来了**，而且内容完好。
+        原因：`ndarray.tofile(str)` 走的是 C 的 fopen，出错时的表现很不友好：
+          - 目标文件被别的程序占着（最常见：你正开着看图软件看上一张）⇒ 报 22；
+          - 路径里正斜杠与反斜杠混用、含中文时，边界情况还会再放大；
+          - 而且它**先截断再写**，写到一半失败会留下半个文件（比报错更糟）。
+        改成本文件的写法：原生 open 写**临时文件**，写完整了再 os.replace 顶替。
+        好处有三：占用时不会毁掉旧文件、不会留半截文件、报错是真报错。
+
+    ★ 真占用了怎么认出来：
+        Windows 上目标被占用会抛 PermissionError(13) 或 OSError(22)；
+        两种都翻译成人话再往上抛，别让用户对着一串 errno 猜。
+    """
     ext = os.path.splitext(path)[1] or ".png"
     ok, buf = cv2.imencode(ext, bgr)
     if not ok:
-        raise IOError("写不了图: " + path)
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    buf.tofile(path)
+        raise IOError("编码失败（扩展名 %s）：%s" % (ext, path))
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    tmp = path + ".writing"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(memoryview(buf))
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)          # 失败时不留垃圾
+        except OSError:
+            pass
+        if exc.errno in (13, 22) or isinstance(exc, PermissionError):
+            raise IOError(
+                "写不进去（文件被占用？先关掉正在看这张图的程序再试）：\n    " + path
+            ) from exc
+        raise
+    return path
 
 
 def _smoothstep(x, a, b):
@@ -625,10 +657,31 @@ def selftest():
 # ============================================================================
 
 def iter_images(root):
-    for dirpath, _dirs, files in os.walk(root):
+    """扫目录里的图。
+
+    ★ 必须跳过的三类（2026-10-01 实测踩过）：
+        场景：源图在 grid\\，输出目录设成 grid\\xxx.png_增强（在源目录**里面**）。
+        第一次跑完，_增强 里就有 4 张 _enh.png；第二次再对 grid\\ 跑，
+        os.walk 会把那 4 张当成新输入，产出 _enh_enh.png，越滚越多 ——
+        这就是「源和工具互相污染」。
+        实测：4 张源图跑出 6 张成品，多出来的两张是 grid-1-1-top-left_enh_enh.png。
+
+        所以：① 名字以 _增强 结尾的目录整个跳过（本工具的默认输出目录名）；
+              ② 以 _enh.png 结尾的文件跳过（本工具的成品命名）；
+              ③ chk 类临时文件（.prep.）跳过（那是看图前的压缩副本）。
+        三者都是本工具自己的产物，不该再被当输入。
+    """
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.endswith("_增强")]
         for f in sorted(files):
-            if f.lower().endswith(EXTS) and ".prep." not in f.lower():
-                yield os.path.join(dirpath, f)
+            low = f.lower()
+            if not low.endswith(EXTS):
+                continue
+            if ".prep." in low:            # 压缩副本
+                continue
+            if low.endswith("_enh.png") or low.endswith("_enh.jpg") or low.endswith("_enh.jpeg"):
+                continue                    # 本工具自己的成品
+            yield os.path.join(dirpath, f)
 
 
 def run_batch(indir, outdir, amount, judge_only, force, scale, dark_gain=0.0, blur_gain=0.0):
